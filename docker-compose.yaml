@@ -158,6 +158,8 @@ services:
       - analytics
     networks:
       - internal
+    environment:
+      PYTHONPATH: /app
     volumes:
       - telemetry_logs:/var/log:ro      # read-only — consumer never writes
     entrypoint: ["python3", "scripts/report.py"]
