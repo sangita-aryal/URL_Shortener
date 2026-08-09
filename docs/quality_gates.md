@@ -2,7 +2,7 @@
 
 **Project:** URL Shortener  
 **Run Date:** 2026-08-09  
-**Branch:** feature/brownfield-analytics  
+**Branch:** feature/final_hardening  
 **Python:** 3.13.0  
 **Tools:** ruff 0.x · bandit 1.9.4 · pytest-cov 7.1.0
 

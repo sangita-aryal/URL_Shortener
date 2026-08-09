@@ -12,6 +12,16 @@ This document traces every major decision across the project lifecycle using **a
 
 ---
 
+## Secure AI Usage
+
+All prompts in this project were submitted through the Anthropic Claude interface (Cowork / Claude Code desktop). No credentials, API keys, internal hostnames, or personally identifiable information were included in any prompt. The Feistel round keys visible in `docker-compose.yaml` are the default development values (`0xDEADBEEF`, `0xCAFEBABE`, etc.) — identical to the values in the public test fixtures — and carry no production sensitivity.
+
+Architecture specifications and code were shared with the AI assistant as context for implementation tasks. All shared content was either already in this repository or derived from public documentation (FastAPI, Motor, aiodns, Redis, MongoDB, Nginx). No proprietary systems, internal APIs, or client data were referenced.
+
+AI output was reviewed before every commit. No AI-generated code was pushed without a human reading it. The two bugs documented in Entry 7 — both caught before the code caused production issues — are evidence of that review process, not exceptions to it.
+
+---
+
 ## How to Read This Document
 
 Each entry records the **full prompt exchange** for that task:

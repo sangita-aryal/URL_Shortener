@@ -197,7 +197,8 @@ async def code_stats(
     analytics: AnalyticsDep,
 ) -> StatsResponse:
     """All-time click count for a single short code."""
-    return StatsResponse(code=code, total_clicks=analytics.click_count_for_code(_LOG_PATH, code))
+    total = await asyncio.to_thread(analytics.click_count_for_code, _LOG_PATH, code)
+    return StatsResponse(code=code, total_clicks=total)
 
 
 @app.get("/analytics", response_model=AnalyticsSummaryResponse)
@@ -215,7 +216,7 @@ async def analytics_summary(
       - No auth: internal network only, consistent with the rest of the API.
     """
     resolved = target_date or datetime.now(UTC).date()
-    summary = analytics.summary_for_date(_LOG_PATH, resolved)
+    summary = await asyncio.to_thread(analytics.summary_for_date, _LOG_PATH, resolved)
     return AnalyticsSummaryResponse(**summary)
 
 
