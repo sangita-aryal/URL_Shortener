@@ -16,7 +16,8 @@ A stateless, distributed URL shortener engineered for high-throughput redirectio
    - [Telemetry Pipeline](#35-telemetry-pipeline)
 4. [Local Setup & Test-Driven Development](#4-local-setup--test-driven-development)
 5. [Environment Variables](#5-environment-variables)
-6. [Frontend](#6-frontend)
+6. [Running the Stack](#6-running-the-stack)
+7. [Frontend](#7-frontend)
 
 ---
 
@@ -350,7 +351,7 @@ pytest tests/test_telemetry.py -v
 
 | Variable | Default | Description |
 |---|---|---|
-| `MONGO_URI` | `mongodb://mongo:27017` | MongoDB connection string. Targets the `url_shortener` database. |
+| `MONGO_URI` | `mongodb://mongo:27017/?replicaSet=rs0` | MongoDB connection string. Must include `replicaSet=rs0` when running via Compose so Motor can enforce `w="majority"` write concerns. |
 | `REDIS_URI` | `redis://redis:6379` | Redis connection string. Used by `URLRepository` for the read-through cache. |
 | `BASE_URL` | `http://localhost` | Public base URL prepended to short codes in the `POST /shorten` response. |
 | `LOG_PATH` | `/var/log/url_shortener_analytics.log` | Append-only telemetry log written by `TelemetryLogger`. Feed this path to `AnalyticsConsumer` for offline DAU and click aggregation. |
@@ -358,7 +359,102 @@ pytest tests/test_telemetry.py -v
 
 ---
 
-## 6. Frontend
+## 6. Running the Stack
+
+### Prerequisites
+
+- Docker Engine ≥ 24 and Docker Compose v2 (`docker compose` command, not `docker-compose`)
+
+### Project layout (orchestration files)
+
+```
+docker-compose.yaml   — full stack definition
+Dockerfile            — FastAPI image (python:3.13-slim + uvicorn)
+.dockerignore         — excludes tests/, docs, and dev artefacts from the build context
+nginx/nginx.conf      — rate limiting, keepalive upstream, X-Real-IP forwarding
+scripts/report.py     — offline analytics report (run via the analytics profile)
+```
+
+### Start the full stack
+
+```bash
+docker compose up --build
+```
+
+This starts six services in dependency order:
+
+```
+mongo → mongo-init → fastapi → nginx
+redis ────────────────────▲
+```
+
+`mongo-init` is a one-shot container that calls `rs.initiate()` to form the
+`rs0` replica set. FastAPI waits on `service_completed_successfully` before
+connecting, so it never opens a MongoDB connection against a standalone node.
+
+### Scale FastAPI workers
+
+```bash
+docker compose up --build --scale fastapi=4
+```
+
+All replicas share the same `telemetry_logs` named volume and inherit round-robin
+load balancing from Nginx's upstream block. Add replica `server` lines to
+`nginx/nginx.conf` for weighted or least-connections scheduling.
+
+### Network isolation
+
+| Service | Public port | Network |
+|---|---|---|
+| `nginx` | **80** | `internal` |
+| `fastapi` | none | `internal` |
+| `redis` | none | `internal` |
+| `mongo` | none | `internal` |
+
+No FastAPI, Redis, or MongoDB port is published to the host. External traffic
+can only enter through Nginx on port 80. The bridge is not flagged
+`internal: true` so FastAPI workers retain outbound connectivity for aiodns
+SSRF validation.
+
+### Liveness probe
+
+```
+GET /health  →  {"status": "ok"}
+```
+
+Used by the docker-compose `healthcheck` (`curl -f http://localhost:8000/health`).
+Nginx waits for this to pass before accepting traffic.
+
+### Daily analytics report (opt-in profile)
+
+The `analytics` service reads the shared `telemetry_logs` volume (read-only)
+and prints DAU, total redirects, and a click-count leaderboard for today's UTC
+date.
+
+```bash
+# Today's report
+docker compose --profile analytics run --rm analytics
+
+# Specific date
+docker compose --profile analytics run --rm analytics --date 2026-08-09
+
+# Extend the leaderboard to top 50
+docker compose --profile analytics run --rm -e TOP_N=50 analytics
+```
+
+### Tear down
+
+```bash
+# Stop containers, keep volumes
+docker compose down
+
+# Stop and delete all data (mongo_data + telemetry_logs)
+docker compose down -v
+```
+
+---
+
+## 7. Frontend
 
 A single-page React application providing a clean UI for shortening URLs.
 
