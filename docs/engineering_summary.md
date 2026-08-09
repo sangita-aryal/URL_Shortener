@@ -1,8 +1,8 @@
-# Engineering Summary — URL Shortener v8.0
+# Engineering Summary — URL Shortener
 
 ## What Was Built
 
-A stateless, distributed URL shortener designed for production-scale throughput: 100M URL creations per day, 1B redirects per day, sub-100ms redirection latency. Built over 2–3 days using AI-assisted engineering with Claude Sonnet 4.6 as the execution accelerator.
+A stateless, distributed URL shortener designed for production-scale throughput: 100M URL creations per day, 1B redirects per day, sub-millisecond redirection latency. Built over 2–3 days using AI-assisted engineering with Claude Sonnet 4.6 as the execution accelerator.
 
 The system is a four-layer stack: Nginx API gateway → stateless FastAPI workers → Redis read-through cache → MongoDB replica set. All business logic is in Python. All infrastructure is containerised and orchestrated via Docker Compose.
 
@@ -30,7 +30,7 @@ The system is a four-layer stack: Nginx API gateway → stateless FastAPI worker
 
 The architecture was derived from capacity numbers, not from defaults. The key chain:
 
-**1B redirects/day → Redis cache is mandatory.** At 11,600 read QPS, MongoDB alone cannot sustain sub-100ms latency. Every redirect must be a cache hit; MongoDB is the fallback.
+**1B redirects/day → Redis cache is mandatory.** At 11,600 read QPS, MongoDB alone cannot sustain sub-millisecond latency. Every redirect must be a cache hit; MongoDB is the fallback.
 
 **100M creations/day → ID generation cannot use read-before-write.** Any strategy that checks for collisions before writing (hashing, truncated UUIDs) doubles write-path latency in the average case and introduces unbounded retries on collision. The Feistel cipher is bijective — it mathematically cannot produce collisions — so the write path is a single `insert_one` with no preliminary read.
 
