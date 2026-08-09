@@ -20,8 +20,8 @@ Design constraints enforced here:
 """
 import json
 from collections import Counter
+from collections.abc import Iterable, Iterator
 from datetime import date, datetime
-from typing import Iterable, Iterator
 
 
 class AnalyticsConsumer:

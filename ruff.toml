@@ -1,0 +1,29 @@
+target-version = "py313"
+line-length = 100
+
+[lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes (unused imports, undefined names)
+    "UP",    # pyupgrade (deprecated stdlib usage)
+    "I",     # isort (import ordering)
+    "BLE",   # flake8-blind-except
+    "S",     # flake8-bandit (security)
+    "FURB",  # refurb (modern Python idioms)
+    "ASYNC", # flake8-async (blocking calls in async context)
+    "RET",   # flake8-return (redundant return statements)
+    "PLR",   # pylint-refactor
+]
+
+[lint.per-file-ignores]
+"tests/**" = [
+    # pytest's assertion rewriting requires plain assert statements
+    "S101",
+    # magic values in test comparisons are expected (testing specific numbers)
+    "PLR2004",
+    # sync file reads in test assertions are intentional: the async write
+    # has already completed before open() runs; no concurrent coroutines
+    # exist in a single-test event loop that would be stalled
+    "ASYNC230",
+]

@@ -26,8 +26,6 @@ API contract under test:
 """
 import pytest
 
-from app.url_repository import URLRepository
-
 _CODE = "aB3cD4e"
 _URL  = "https://example.com/some/long/path?q=test"
 _URL_BYTES = _URL.encode()      # redis.get returns bytes
@@ -209,7 +207,6 @@ class TestReadOrder:
 
         async def _redis_get(key):
             log.append("redis.get")
-            return None
 
         async def _find_one(filter_doc, **kw):
             log.append("mongo.find_one")

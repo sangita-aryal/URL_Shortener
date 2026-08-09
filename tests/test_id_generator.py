@@ -20,7 +20,6 @@ Per architect.md §3:
 """
 import re
 import time
-from unittest.mock import AsyncMock
 
 import pytest
 
