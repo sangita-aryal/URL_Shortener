@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
     mongo = motor.motor_asyncio.AsyncIOMotorClient(
         _MONGO_URI,
         w="majority",
-        j=True,
+        journal=True,
     )
     db = mongo["url_shortener"]
 
