@@ -1,15 +1,28 @@
 # URL Shortener
 
-A stateless, distributed URL shortener engineered for high-throughput
-redirection at production scale.
+A stateless, distributed URL shortener engineered for high-throughput redirection at production scale.
 
-| Metric | Target |
-|---|---|
-| Daily read volume | 1 billion redirects (~11,600 avg QPS) |
-| Daily write volume | 100 million creations (~2,320 peak QPS) |
-| Key length | 7 characters, Base-62 (3.52 trillion unique keys) |
+---
 
-## System Architecture
+## Table of Contents
+
+1. [Project Overview & Tech Stack](#1-project-overview--tech-stack)
+2. [Capacity Planning & Scale](#2-capacity-planning--scale)
+3. [Architectural Decisions & Trade-offs](#3-architectural-decisions--trade-offs)
+   - [NoSQL (MongoDB) vs. Relational (SQL)](#31-architectural-decision-nosql-mongodb-vs-relational-sql)
+   - [Distributed ID Generation](#32-distributed-id-generation)
+   - [HTTP 301 vs. HTTP 302 Redirects](#33-architectural-decision-http-301-vs-http-302-redirects)
+   - [Security — SSRF Shield](#34-security--ssrf-shield)
+   - [Telemetry Pipeline](#35-telemetry-pipeline)
+4. [Local Setup & Test-Driven Development](#4-local-setup--test-driven-development)
+5. [Environment Variables](#5-environment-variables)
+6. [Frontend](#6-frontend)
+
+---
+
+## 1. Project Overview & Tech Stack
+
+The system is a fully distributed URL shortener built around four layers, each chosen for a specific role at scale:
 
 ```
 Internet
@@ -20,37 +33,86 @@ Internet
 │  Rate limiting · SSL termination │     Buffers slow clients; protects
 │  Reverse proxy to internal net  │     ASGI workers from I/O starvation.
 └──────────────┬──────────────────┘
-               │  private network
+               │  private internal network
    ┌───────────┴───────────┐
    ▼                       ▼
-FastAPI worker 0      FastAPI worker N     ← Stateless. No local session
-   │                       │                 or presentation state.
-   ├─── read ──────────────┼──▶  Redis cluster   (O(1) cache hit)
+FastAPI worker 0      FastAPI worker N     ← 100% stateless. No session
+   │                       │                 or presentation state stored
+   ├─── read ──────────────┼──▶  Redis cluster      (O(1) cache hit)
    │                       │
    └─── write/miss ────────┴──▶  MongoDB sharded cluster
 ```
 
-Nginx is the **only** component exposed to the public internet. All
-FastAPI, Redis, and MongoDB communication happens over a private internal
-network.
+| Layer | Technology | Role |
+|---|---|---|
+| Edge Proxy / API Gateway | Containerized Nginx (Layer 7) | Public entry point; rate limiting, SSL termination, slow-client buffering |
+| Application Tier | Stateless Python FastAPI (ASGI / Uvicorn) | Business logic; 100% stateless — all state lives in the data tier |
+| Cache Infrastructure | Redis RAM Cluster | Read-through cache; O(1) short-code lookups on the hot redirect path |
+| Database Tier | Horizontally Sharded MongoDB Cluster | Durable URL persistence; segment lease counter; replica set for majority writes |
+| AI Development Accelerator | Claude Sonnet 4.6 (Anthropic) | Drove the full TDD workflow — test authoring, implementation, architecture review, and documentation — accelerating delivery across every layer of the stack |
+
+**Architectural constraints enforced across every layer:**
+
+- Nginx is the **only** component with a public-facing IP. FastAPI, Redis, and MongoDB communicate exclusively over a private internal Docker network.
+- FastAPI workers store **no** client state, session tokens, or presentation state in local memory.
+- Every write is acknowledged only after `w="majority"` and `j=True` (journaling) are satisfied on the MongoDB replica set.
 
 ---
 
-## Design Decisions
+## 2. Capacity Planning & Scale
 
-### 1 — 42-Bit Feistel Cipher (ID Scrambling)
+Back-of-the-envelope estimates that drive every architectural decision in this system:
 
-**The problem.** Sequential auto-increment IDs allow a client to enumerate
-every shortened URL by incrementing the counter. UUIDs avoid this but are
-128 bits — far too long for a 7-character short code. Hash functions are
-not bijective: two inputs can collide on the same output, requiring an
-expensive database read-before-write check.
+| Dimension | Daily | Per Second (avg) |
+|---|---|---|
+| URL creations (writes) | 100,000,000 | ~1,157 (peak ~2,320) |
+| Redirects (reads) | 1,000,000,000 | ~11,600 |
 
-**The solution.** Each sequential integer produced by the lease manager is
-scrambled by a custom in-memory 42-bit Feistel network before encoding.
+**10-year storage projection:**
 
-A balanced Feistel cipher splits the 42-bit integer into two 21-bit halves
-and applies 4 rounds of the following transform:
+| Dimension | Estimate |
+|---|---|
+| Daily URL creations | 100,000,000 |
+| 10-year record count | ~365,000,000,000 (365 billion) |
+| Storage per record (document + indexes) | ~100 bytes |
+| Total persistent storage required | ~36.5 TB |
+| Short code keyspace (7-char Base-62) | 3,521,614,606,208 unique keys |
+
+These numbers impose hard requirements: no single database node can hold 36.5 TB of hot data, 11,600 read QPS demands sub-millisecond cache hits, and 7-character short codes must be collision-free across 365 billion records without expensive read-before-write checks.
+
+---
+
+## 3. Architectural Decisions & Trade-offs
+
+### 3.1 Architectural Decision: NoSQL (MongoDB) vs. Relational (SQL)
+
+Two capacity constraints drove the database technology choice away from a traditional RDBMS.
+
+#### Massive scale demands horizontal scalability
+
+No single relational database node can hold 36.5 TB of hot, indexed data while sustaining millions of writes per day. The standard answer — horizontal sharding — is where SQL breaks down. Cross-shard joins require coordinated scatter-gather queries across nodes, and dynamic resharding (rebalancing data when a shard becomes full) is a notoriously complex, error-prone operation that typically requires significant downtime or custom migration tooling.
+
+MongoDB is natively engineered for this model. Its sharding layer distributes documents across nodes transparently; adding capacity is an operational procedure, not a schema migration. Our data access pattern (lookup by `_id`, write by `_id`) requires no cross-shard joins — every query is shard-key routable to a single node.
+
+#### Predictable low-latency lookups on a simple data model
+
+The redirect read path must sustain **11,600 requests per second** at sub-millisecond latency. The data model is a pure key-value mapping: resolve a 7-character string to a destination URL. There are no foreign keys, no aggregations, no multi-table joins.
+
+Relational databases use B-tree indexes for row lookups. B-tree performance degrades as the index grows: at hundreds of billions of rows, the tree becomes deep enough that a single key lookup requires multiple random disk reads to traverse from root to leaf. As the dataset grows, B-tree traversal cost grows logarithmically — producing an unpredictable and growing latency tail that violates the sub-millisecond requirement.
+
+MongoDB's WiredTiger storage engine maintains a B-tree index on `_id` per shard. Because each shard owns only a partition of the keyspace, the index per shard stays shallow and fast regardless of total cluster size. Adding shards reduces both index depth and per-shard I/O load proportionally, keeping redirect latency stable as the dataset scales to hundreds of billions of documents.
+
+---
+
+### 3.2 Distributed ID Generation
+
+#### The hybrid approach: Feistel Cipher + MongoDB Segment Leasing
+
+Standard auto-incrementing IDs create enumeration vulnerabilities. UUIDs are 128 bits — far too long for a 7-character short code. Hash functions are not bijective: two inputs can collide on the same output, requiring an expensive read-before-write database check. The solution combines two components:
+
+**42-Bit Feistel Cipher (scrambling)**
+
+Each sequential integer produced by the lease manager is scrambled by a custom in-memory 42-bit Feistel network before encoding. A balanced Feistel cipher splits the 42-bit integer into two 21-bit halves and applies 4 rounds:
 
 ```
 Input: (L, R)  ← two 21-bit halves of the plaintext
@@ -61,104 +123,94 @@ For each round i:
 Output: join(L, R)  → 42-bit ciphertext
 ```
 
-The Feistel structure **mathematically guarantees bijectivity** — every
-input maps to a unique output — regardless of the round function `f`. This
-eliminates collisions without any database lookup.
+The Feistel structure **mathematically guarantees bijectivity** — every input maps to a unique output, regardless of the round function `f`. This eliminates collisions without any database lookup.
 
-**Why 42 bits.** 62⁷ = 3,521,614,606,208 fits between 2⁴¹ and 2⁴², so
-a 42-bit cipher domain is the smallest that covers the full 7-character
-Base-62 space. Values that land above 62⁷ − 1 are walked through the
-permutation chain (cycle-walking) until they fall within the encodable
-range — a standard format-preserving encryption technique.
+**Why 42 bits:** 62⁷ = 3,521,614,606,208 fits between 2⁴¹ and 2⁴², so a 42-bit cipher domain is the smallest that covers the full 7-character Base-62 space. Values that land above 62⁷ − 1 are walked through the permutation chain (cycle-walking) until they fall within the encodable range — a standard format-preserving encryption technique.
 
 Relevant source: [`app/id_generator.py`](app/id_generator.py) — `FeistelCipher`
 
----
+**MongoDB Segment Leasing (O(1) ID generation)**
 
-### 2 — MongoDB Range Pre-Allocation (Segment Leasing)
-
-**The problem.** A central atomic counter contacted on every write is a
-single point of network contention. Snowflake-style IDs require
-synchronized clocks across workers. UUID4 is unordered and at 128 bits
-cannot be encoded in 7 characters.
-
-**The solution.** On startup (and whenever its local block is exhausted),
-each FastAPI worker contacts MongoDB once to atomically claim a contiguous
-block of one million sequence numbers:
+On startup (and whenever its local block is exhausted), each FastAPI worker contacts MongoDB once to atomically claim a contiguous block of 10,000 sequence numbers:
 
 ```python
 result = await collection.find_one_and_update(
     {"_id": "url_sequence"},
-    {"$inc": {"seq": 1_000_000}},
+    {"$inc": {"seq": 10_000}},
     upsert=True,
     return_document=True,
 )
 ```
 
-The worker stores the range locally (`current`, `ceiling`) and increments
-a counter in O(1) memory. **999,999 of every 1,000,000 ID assignments
-involve zero network I/O.**
+The worker stores the range locally (`current`, `ceiling`) and increments an in-memory counter in O(1). **9,999 of every 10,000 ID assignments involve zero network I/O.**
 
-**Durability.** The MongoDB connection uses `w="majority"` and `j=True`
-(journaling). No lease is granted until the sequence document is durably
-written to a majority of replica nodes, preventing lease rollback on a
-primary failover.
+**Durability:** The MongoDB connection uses `w="majority"` and `j=True` (journaling). No lease is granted until the sequence document is durably written to a majority of replica nodes, preventing lease rollback on a primary failover.
 
 Relevant source: [`app/id_generator.py`](app/id_generator.py) — `SequenceLeaseManager`
 
-#### Architectural Trade-off: Lease Size
+#### Trade-off: Lease size (10,000 vs. 1,000,000)
 
-The `DEFAULT_LEASE_SIZE` is set to **10,000** (not 1,000,000).
+FastAPI workers run inside stateless containers that can be killed at any time — by an OOM killer, a rolling deployment, or a node preemption. When a worker is killed mid-lease, every ID it claimed but never used is permanently lost, creating gaps in the ID space.
 
-A larger block reduces database round-trips further, but introduces a
-crash-leakage problem. FastAPI workers run inside stateless containers that can
-be killed at any time — by an OOM killer, a rolling deployment, or a
-node preemption. When a worker is killed mid-lease, every ID it claimed but
-never used is permanently lost; those sequence numbers will never be encoded
-into a short code, creating gaps in the ID space.
+| Lease size | Max IDs leaked per crash | MongoDB fetches/day (at 100M writes) |
+|---|---|---|
+| 1,000,000 | 999,999 | 100 |
+| **10,000** | **9,999** | **10,000** |
 
-With a lease of 1,000,000 a single OOM kill can leak up to 999,999 IDs. Over
-time, on a fleet of containers subject to regular restarts, this leakage
-accumulates and pushes the global counter far ahead of the number of URLs
-actually created — wasting a non-trivial portion of the 3.52 trillion available
-key space.
+Reducing the lease to 10,000 caps worst-case leakage at 9,999 IDs per crash — a **99% reduction** — while 10,000 `find_one_and_update` calls per day is completely negligible against the replica set's capacity (millions of ops/day).
 
-Reducing the lease to 10,000 caps worst-case leakage at 9,999 IDs per
-crash — a **99% reduction** — while the resulting database load remains
-completely trivial:
+#### Evaluated Alternatives & Why We Rejected Them
 
-| Metric | Value |
-|---|---|
-| Daily URL creations (target) | 100,000,000 |
-| Lease size | 10,000 |
-| Maximum MongoDB lease fetches per day | 10,000 |
-| Comparison: MongoDB write capacity | millions of ops/day |
+**1. Relational DB Auto-Increment & Multi-Master Replication**
 
-10,000 `find_one_and_update` calls per day is negligible against the
-database's capacity. The durability guarantee (`w="majority"`, `j=True`) is
-preserved on every one of those calls.
+Sequential IDs are trivially guessable — an attacker can iterate through every shortened URL ever created by simply incrementing the short code. The common multi-master workaround (Server A generates odd numbers, Server B generates even) is operationally brittle: the step size must be fixed at cluster inception, adding or removing a node mid-operation breaks the scheme, and chronological ordering is not maintained across nodes.
+
+**2. Hashing (MD5 / SHA-256)**
+
+Hashing the destination URL and truncating the digest to 7 characters retains only ~41 bits of the original digest. By the birthday paradox, the probability of a collision reaches 50% after approximately 1.5 million URLs. Each collision requires a read-before-write round-trip to the database, doubling write-path latency in the common case and adding an unbounded retry loop in the worst case.
+
+**3. Universally Unique Identifiers (UUIDs)**
+
+A standard UUID v4 is 36 characters long (e.g., `550e8400-e29b-41d4-a716-446655440000`). Using one as a short code defeats the primary product requirement. Truncating a UUID to 7 characters strips its collision-resistance properties and reintroduces the birthday-paradox collision risk described above.
 
 ---
 
-### 3 — Non-Blocking aiodns SSRF Shield
+### 3.3 Architectural Decision: HTTP 301 vs. HTTP 302 Redirects
 
-**The problem.** `socket.getaddrinfo` is a blocking system call. When
-called from an ASGI event loop thread it stalls **every concurrent
-coroutine** for the full round-trip duration — often 50–300 ms under load.
-This is event-loop starvation: a standard library call silently serialises
-all in-flight requests.
+The choice of redirect status code has a direct and permanent consequence on what the telemetry pipeline can observe.
 
-**The solution.** DNS resolution is performed exclusively through
-[aiodns](https://github.com/saghul/aiodns), which wraps the c-ares
-asynchronous resolver. Resolution is dispatched as a non-blocking I/O
-event; the coroutine yields until the result arrives without blocking the
-thread.
+| | HTTP 301 — Permanent Redirect | HTTP 302 — Temporary Redirect ✓ |
+|---|---|---|
+| **Browser behaviour** | Caches the redirect indefinitely | Does not cache; re-requests on every click |
+| **Repeat clicks** | Resolved client-side; never reach the server | Every click hits the server for resolution |
+| **Server load** | Minimal after the first visit per user | Full load on every redirection event |
+| **Telemetry visibility** | Blind to repeat traffic from returning visitors | Every click is observable by the backend |
+
+**HTTP 301 (Permanent Redirect):** The browser stores the destination URL in its local cache and performs all future redirects for that short code entirely client-side. This minimises backend load and infrastructure cost, making it the right choice for static content that will never change destination — but it blinds the backend to repeat traffic.
+
+**HTTP 302 (Temporary Redirect) — Our Choice:** The browser does not cache the redirect. Every click on a shortened URL — whether the user's first visit or their hundredth — resolves through our server.
+
+We selected HTTP 302 because our system requirements mandate precise, real-time tracking of click metrics, source analytics, and user telemetry. Sacrificing the caching benefits of a 301 is a deliberate and necessary trade-off: a 301 would silently discard the repeat-visit traffic that our DAU and total-click aggregations depend on, making the analytics irrecoverably incomplete. Every redirection event must reach the server so the `TelemetryLogger` can append it to the pipeline.
+
+Relevant source: [`app/app.py`](app/app.py) — `GET /{short_code}` route
+
+---
+
+### 3.4 Security — SSRF Shield
+
+#### The problem: blocking DNS in an async event loop
+
+`socket.getaddrinfo` is a blocking system call. When called from an ASGI event loop thread it stalls **every concurrent coroutine** for the full round-trip duration — often 50–300 ms under load. This is event-loop starvation: a standard library call silently serialises all in-flight requests.
+
+#### The solution: aiodns
+
+DNS resolution is performed exclusively through [aiodns](https://github.com/saghul/aiodns), which wraps the c-ares asynchronous resolver. Resolution is dispatched as a non-blocking I/O event; the coroutine yields until the result arrives without blocking the thread.
 
 ```python
-# ✗  Blocks the event loop
+# ✗  Blocks the event loop — stalls all concurrent coroutines
 socket.getaddrinfo(host, None)
 
-# ✓  Yields to the event loop; other coroutines continue
+# ✓  Yields to the event loop; other coroutines continue unblocked
 await resolver.gethostbyname(host, socket.AF_INET)
 ```
 
@@ -176,71 +228,21 @@ await resolver.gethostbyname(host, socket.AF_INET)
 | Schemes | Only `http` and `https` |
 | DNS failure | Treated as a block (fail-safe) |
 
-Literal IPs in the URL bypass DNS resolution entirely. Hostnames that
-resolve to any blocked range are rejected (DNS rebinding defence).
+Literal IPs in the URL bypass DNS resolution entirely. Hostnames that resolve to any blocked range are rejected (DNS rebinding defence).
 
 Relevant source: [`app/ssrf_validator.py`](app/ssrf_validator.py) — `validate_url`
 
 ---
 
-### 4 — Redis Read-Through Cache (URL Persistence)
+### 3.5 Telemetry Pipeline
 
-**The problem.** Serving one billion redirects per day at ~11,600 QPS means
-the dominant operation is a key lookup by short code. Hitting MongoDB on
-every redirect would saturate the database's read capacity and add network
-round-trip latency to the hot path (target: sub-millisecond redirection).
+#### The problem: analytics must not compete with the cache
 
-**The solution.** `URLRepository` implements a read-through cache pattern
-that keeps the hot path entirely in Redis RAM:
+Buffering click analytics directly in Redis is an anti-pattern at this scale: every `INCR` or `PFADD` competes with the hot URL cache for RAM, forcing LRU evictions of frequently-redirected short codes. Evicting a hot URL from Redis turns a sub-millisecond cache hit into a full MongoDB round-trip — exactly the latency the cache exists to prevent.
 
-```
-Write path — save(short_code, url)
-  insert_one → MongoDB (w="majority", j=True)
-  Redis is NOT touched. Cache population is strictly lazy.
+#### The solution: async local logging + offline stream processing
 
-Read path — get(short_code)
-  1. redis.get(short_code)
-     ├─ HIT  → decode bytes → return URL  ← MongoDB never opened
-     └─ MISS → find_one({"_id": short_code})
-               ├─ FOUND     → redis.set(short_code, url) → return URL
-               └─ NOT FOUND → return None  (Redis NOT written)
-```
-
-**Why lazy population on the write path.** Writing to Redis on `save()`
-would couple the write-path latency to two sequential network calls (Mongo
-+ Redis). Lazy population means only the first read miss pays that cost;
-every subsequent read for the same code is a sub-millisecond Redis hit.
-
-**Why not write `None` to Redis on a miss.** A short code that does not
-exist today may be created tomorrow. Caching `None` would serve stale
-404s until the TTL expires. The repository intentionally skips the Redis
-write on not-found.
-
-**Durability.** The MongoDB client is configured with `w="majority"` and
-`j=True`. No URL document is acknowledged until it is durably written to a
-majority of replica nodes and flushed to the journal, preventing data loss
-on a primary failover.
-
-**The call sequence is a first-class contract.** The interaction order
-`redis.get → mongo.find_one → redis.set` is enforced by `TestReadOrder`
-using a side-effect call log, not just presence/absence checks.
-
-Relevant source: [`app/url_repository.py`](app/url_repository.py) — `URLRepository`
-
----
-
-### 5 — Async Telemetry Pipeline (File-Based, Not Redis)
-
-**The problem.** Buffering click analytics directly in Redis is an
-anti-pattern at this scale: every `INCR` or `PFADD` competes with the
-hot URL cache for RAM, forcing LRU evictions of frequently-redirected
-short codes. Evicting a hot URL from Redis turns a sub-millisecond cache
-hit into a full MongoDB round-trip — exactly the latency the cache exists
-to prevent.
-
-**The solution.** Each FastAPI worker appends structured JSON telemetry
-entries to a local append-only log file. An offline Python script
-(`app/analytics.py`) streams the log independently of the hot path.
+Each FastAPI worker appends structured JSON telemetry entries to a local append-only log file as a fire-and-forget background task:
 
 ```
 Redirect request
@@ -250,129 +252,54 @@ Redirect request
       │
       └──▶ asyncio.create_task(telemetry.record_redirect(...))
                 │
-                ▼ (background — does not block the response)
+                ▼ (background — does not block the 302 response)
            asyncio.to_thread(_append)
                 │
                 ▼
            /var/log/url_shortener_analytics.log
            {"ts":"2026-08-09T10:00:00+00:00","code":"aB3cD4e","ip":"203.0.113.42"}
            {"ts":"2026-08-09T10:00:01+00:00","code":"xY9zW1q","ip":"198.51.100.7"}
-           ...
 ```
 
-**Why `asyncio.create_task`, not `await`.** The `create_task` call
-schedules the log write on the running event loop and returns
-immediately. The 302 response is transmitted to the client before the
-log entry hits disk. Even if the log write fails (disk full, missing
-directory), the exception is swallowed internally — telemetry loss is
-preferable to a failed redirect.
+- **`asyncio.create_task`** (not `await`) schedules the log write and returns immediately. The 302 response is transmitted to the client before the log entry hits disk. If the write fails, the exception is swallowed — telemetry loss is preferable to a failed redirect.
+- **`asyncio.to_thread`** offloads the blocking `open()` / `write()` call to the thread-pool executor, keeping the event loop free.
 
-**Why `asyncio.to_thread` inside the logger.** Python's built-in file
-I/O is blocking. Calling `open()` / `write()` directly in a coroutine
-would stall every other coroutine on the thread for the duration of the
-syscall. `asyncio.to_thread` offloads the write to the thread-pool
-executor, keeping the event loop free.
+**Offline analytics consumer:** `AnalyticsConsumer` reads the log file as a lazy generator — one line at a time, never the whole file — maintaining O(U) space complexity bounded strictly by unique users:
 
-**Offline analytics consumer.** `AnalyticsConsumer` reads the log file
-as a lazy generator — one line at a time, never the whole file — and
-computes two aggregates:
-
-| Method | Algorithm | Space |
+| Method | Algorithm | Space complexity |
 |---|---|---|
 | `compute_dau(entries)` | Insert each `ip` into a Python `set`; return `len(set)` | O(U) — unique users only |
 | `compute_total_clicks(entries)` | `collections.Counter` over `code` field | O(K) — unique short codes |
 
-`entries_for_date(log_path, target_date)` filters the stream to a single
-UTC date before aggregation, preventing yesterday's traffic from
-inflating today's DAU.
+`entries_for_date(log_path, target_date)` filters the stream to a single UTC date before aggregation, preventing prior-day traffic from inflating today's DAU.
 
-Relevant sources:
-[`app/telemetry.py`](app/telemetry.py) — `TelemetryLogger` ·
-[`app/analytics.py`](app/analytics.py) — `AnalyticsConsumer`
+Relevant sources: [`app/telemetry.py`](app/telemetry.py) — `TelemetryLogger` · [`app/analytics.py`](app/analytics.py) — `AnalyticsConsumer`
 
 ---
 
-## Frontend
+## 4. Local Setup & Test-Driven Development
 
-A single-page React application that provides a clean UI for shortening URLs.
+The entire codebase was written using **contract-driven, test-first development**: every test was written and approved before a single line of implementation code. Tests define the observable contracts; implementation exists to satisfy them.
 
-**Tech:** Vite 5 + React 18 + Tailwind CSS 3 — no Redux, no routing library.
-
-**Features:**
-
-- Centered layout with a large URL input and "Shorten →" button
-- Async `POST /shorten` with loading state (spinner on button)
-- SSRF 400 errors displayed as a "REQUEST BLOCKED" banner with the exact server message
-- Network errors surfaced as a user-friendly fallback message
-- Success panel with the full short URL as a clickable `<a target="_blank" rel="noopener noreferrer">` link and a one-click "Copy" button
-- "Start over" action resets all state and returns focus to the input
-
-### Frontend environment variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `VITE_API_BASE` | _(empty)_ | Base URL for API calls (e.g. `http://localhost:8000`). Omit in production when the SPA is served behind the same Nginx origin as the API. |
-
-### Running the frontend (development)
-
-```bash
-cd frontend
-npm install
-npm run dev
-# → http://localhost:5173
-```
-
-During development Vite proxies `/shorten` to `http://localhost:8000`, so the FastAPI backend must be running locally on port 8000.
-
-### Building for production
-
-```bash
-cd frontend
-npm run build
-# Static assets emitted to frontend/dist/
-```
-
-Serve `frontend/dist/` from Nginx's root so the SPA and API share the same origin, eliminating CORS and the need for the `VITE_API_BASE` variable.
-
----
-
-## Environment Variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `MONGO_URI` | `mongodb://mongo:27017` | MongoDB connection string. Targets the `url_shortener` database. |
-| `REDIS_URI` | `redis://redis:6379` | Redis connection string. Used by `URLRepository` for the read-through cache. |
-| `BASE_URL` | `http://localhost` | Public base URL prepended to short codes in the `POST /shorten` response. |
-| `LOG_PATH` | `/var/log/url_shortener_analytics.log` | Append-only telemetry log written by `TelemetryLogger`. Feed this path to `AnalyticsConsumer` for offline DAU and click aggregation. |
-| `FEISTEL_KEY_0` – `FEISTEL_KEY_3` | `0xDEADBEEF`, `0xCAFEBABE`, `0x12345678`, `0xABCDEF01` | Four 32-bit Feistel round keys. Rotate per deployment to prevent short-code prediction. |
-
----
-
-## Running the Test Suite
-
-The test suite is written with `pytest` and `pytest-asyncio` following a
-strict contract-first (test-first) approach. Tests were written before any
-implementation code.
-
-**Install dependencies**
+### Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-**Run the full suite (146 tests)**
+### Run the full test suite
 
 ```bash
 pytest tests/ -v
 ```
 
-**Run without throughput benchmarks**
+### Run without slow throughput benchmarks
 
 ```bash
 pytest tests/ -v -m "not slow"
 ```
 
-**Run a single module**
+### Run a single module
 
 ```bash
 pytest tests/test_id_generator.py -v
@@ -392,8 +319,8 @@ pytest tests/test_telemetry.py -v
 | | `TestFeistelCipherKeySensitivity` | Different round keys → different ciphertexts |
 | | `TestFeistelCipherRoundCount` | `ROUNDS == 4`, `BITS == 42`; constructor rejects ≠ 4 keys |
 | | `TestSequenceLeaseManagerDBInteraction` | `find_one_and_update` called once for 1,000 sequential IDs; exhaustion boundary tested at `lease_size=5` |
-| | `TestSequenceLeaseManagerOOneComplexity` | 10,000 in-lease calls in under 1 s with zero DB calls |
-| | `TestSequenceLeaseManagerConstants` | `DEFAULT_LEASE_SIZE == 1_000_000` |
+| | `TestSequenceLeaseManagerOOneComplexity` | 5,000 in-lease calls complete in under 1 s with zero DB calls |
+| | `TestSequenceLeaseManagerConstants` | `DEFAULT_LEASE_SIZE == 10_000` |
 | | `TestIDGenerator` | Full pipeline: seq ID → Feistel → 7-char Base-62; 1,000 IDs are unique |
 | `test_ssrf_validator.py` | `TestHappyPath` | Valid public URLs pass; literal IPs skip DNS |
 | | `TestAiodnsUsage` | `resolver.gethostbyname` is called (never `socket.getaddrinfo`); bare hostname passed; called exactly once |
@@ -416,3 +343,59 @@ pytest tests/test_telemetry.py -v
 | | `TestDAUComputation` | One IP → 1; same IP twice → 1 (dedup); two IPs → 2; empty → 0; 1,000 entries / 500 unique IPs → 500; return type is `int` |
 | | `TestClickComputation` | One click → 1; two clicks same code → 2; two codes counted independently; empty → `{}`; values are `int` |
 | | `TestDateIsolation` | Today's filter excludes yesterday; yesterday's filter excludes today; `entries_for_date` is a generator; full pipeline `entries_for_date → compute_dau` excludes prior-day IPs |
+
+---
+
+## 5. Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `MONGO_URI` | `mongodb://mongo:27017` | MongoDB connection string. Targets the `url_shortener` database. |
+| `REDIS_URI` | `redis://redis:6379` | Redis connection string. Used by `URLRepository` for the read-through cache. |
+| `BASE_URL` | `http://localhost` | Public base URL prepended to short codes in the `POST /shorten` response. |
+| `LOG_PATH` | `/var/log/url_shortener_analytics.log` | Append-only telemetry log written by `TelemetryLogger`. Feed this path to `AnalyticsConsumer` for offline DAU and click aggregation. |
+| `FEISTEL_KEY_0` – `FEISTEL_KEY_3` | `0xDEADBEEF`, `0xCAFEBABE`, `0x12345678`, `0xABCDEF01` | Four 32-bit Feistel round keys. Rotate per deployment to prevent short-code prediction. |
+
+---
+
+## 6. Frontend
+
+A single-page React application providing a clean UI for shortening URLs.
+
+**Tech:** Vite 5 + React 18 + Tailwind CSS 3 — no Redux, no routing library.
+
+**Features:**
+
+- Centered layout with a large URL input and "Shorten →" button
+- Async `POST /shorten` with loading spinner
+- SSRF 400 errors displayed as a "REQUEST BLOCKED" banner with the exact server message
+- Network errors surfaced as a user-friendly fallback message
+- Success panel with the full short URL as a clickable `<a target="_blank" rel="noopener noreferrer">` link and a one-click Copy button
+- "Start over" action resets all state and returns focus to the input
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `VITE_API_BASE` | _(empty)_ | Base URL for API calls (e.g. `http://localhost:8000`). Omit in production when the SPA is served behind the same Nginx origin as the API. |
+
+### Running (development)
+
+```bash
+cd frontend
+npm install
+npm run dev
+# → http://localhost:5173
+```
+
+During development, Vite proxies `/shorten` to `http://localhost:8000`, so the FastAPI backend must be running locally on port 8000.
+
+### Building for production
+
+```bash
+cd frontend
+npm run build
+# Static assets emitted to frontend/dist/
+```
+
+Serve `frontend/dist/` from Nginx's root so the SPA and API share the same origin, eliminating CORS and the need for `VITE_API_BASE`.
