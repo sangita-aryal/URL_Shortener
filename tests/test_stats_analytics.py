@@ -44,8 +44,7 @@ _TS_TODAY = datetime(_TODAY.year, _TODAY.month, _TODAY.day, 12, 0, 0, tzinfo=UTC
 
 def _write(path: str, entries: list[dict]) -> None:
     with open(path, "w") as f:
-        for e in entries:
-            f.write(json.dumps(e) + "\n")
+        f.writelines(json.dumps(e) + "\n" for e in entries)
 
 
 def _entry(code: str, ip: str, ts: str = _TS_TODAY) -> dict:

@@ -2,7 +2,7 @@
 
 **Project:** URL Shortener  
 **Run Date:** 2026-08-09  
-**Branch:** feature/quality_gates  
+**Branch:** feature/brownfield-analytics  
 **Python:** 3.13.0  
 **Tools:** ruff 0.x · bandit 1.9.4 · pytest-cov 7.1.0
 
@@ -14,8 +14,8 @@
 |---|---|---|---|
 | Linting | ruff | **PASS** | 0 issues |
 | Security scan | bandit | **PASS** | 1 Low / 0 Medium / 0 High |
-| Test suite | pytest | **PASS** | 146 / 146 passed (0.54 s) |
-| Test coverage | pytest-cov | **PASS** | 70% overall |
+| Test suite | pytest | **PASS** | 172 / 172 passed (1.10 s) |
+| Test coverage | pytest-cov | **PASS** | 87% overall |
 
 ---
 
@@ -83,7 +83,7 @@ except Exception:  # noqa: BLE001, S110
 ### Scan metrics
 
 ```
-Total lines of code scanned : 462
+Total lines of code scanned : 525
 Total lines skipped          : 0
 
 Total issues (by severity):
@@ -94,14 +94,14 @@ Total issues (by severity):
 Files skipped: 0
 ```
 
-No injection vulnerabilities, hardcoded secrets, weak cryptography, insecure deserialization, or unsafe subprocess usage found across 462 lines.
+No injection vulnerabilities, hardcoded secrets, weak cryptography, insecure deserialization, or unsafe subprocess usage found across 525 lines.
 
 ---
 
 ## 3. Test Suite — pytest
 
 **Command:** `pytest tests/ --cov=app --cov-report=term-missing`  
-**Result:** PASS — 146 / 146 passed in 0.54 s
+**Result:** PASS — 172 / 172 passed in 1.10 s
 
 ### Results by module
 
@@ -109,40 +109,45 @@ No injection vulnerabilities, hardcoded secrets, weak cryptography, insecure des
 |---|---|---|
 | `tests/test_id_generator.py` | 37 | PASS |
 | `tests/test_ssrf_validator.py` | 53 | PASS |
+| `tests/test_stats_analytics.py` | 26 | PASS |
 | `tests/test_telemetry.py` | 35 | PASS |
 | `tests/test_url_repository.py` | 21 | PASS |
-| **Total** | **146** | **PASS** |
+| **Total** | **172** | **PASS** |
 
 ---
 
 ## 4. Test Coverage — pytest-cov
 
-**Result:** 70% overall (264 statements, 79 missed)
+**Result:** 87% overall (305 statements, 39 missed)
 
 ### Coverage by module
 
 | Module | Stmts | Miss | Cover | Missing lines |
 |---|---|---|---|---|
 | `app/__init__.py` | 0 | 0 | **100%** | — |
-| `app/analytics.py` | 37 | 2 | **95%** | 46–47 |
-| `app/app.py` | 73 | 73 | **0%** | 13–199 (all) |
+| `app/analytics.py` | 53 | 2 | **96%** | 50–51 |
+| `app/app.py` | 98 | 33 | **66%** | 57–79, 89, 93, 97, 106, 110, 114, 118, 163, 180–188, 240–252 |
 | `app/id_generator.py` | 73 | 2 | **97%** | 27, 32 |
 | `app/ssrf_validator.py` | 50 | 2 | **96%** | 45–46 |
 | `app/telemetry.py` | 15 | 0 | **100%** | — |
 | `app/url_repository.py` | 16 | 0 | **100%** | — |
-| **TOTAL** | **264** | **79** | **70%** | |
+| **TOTAL** | **305** | **39** | **87%** | |
+
+### Coverage improvement
+
+The addition of `tests/test_stats_analytics.py` (26 tests) brought `app/app.py` from **0% → 66%** by exercising the two new endpoints via `httpx.AsyncClient` with a null lifespan fixture. The brownfield and ambiguous features account for the coverage gain.
 
 ### Coverage gap detail
 
-#### `app/app.py` — 0% (expected)
+#### `app/app.py` — 66%
 
-`app.py` is the FastAPI wiring layer (lifespan, DI providers, route handlers). The test suite uses unit/contract tests with mocked dependencies and does not spin up a live FastAPI instance. The 0% is expected — the correctness of each composed module is verified at 95–100% in isolation.
+Missing lines are the lifespan startup/shutdown block (lines 57–79) and the DI provider functions for MongoDB, Redis, and existing routes (shorten, redirect). These require a live stack to exercise. The new `/stats` and `/analytics` endpoints are fully covered via the endpoint tests.
 
-**Path to coverage:** Add `tests/test_app.py` using FastAPI's `TestClient` or `httpx.AsyncClient` with a mocked lifespan to exercise the HTTP round-trip.
+**Path to remaining coverage:** A `docker compose` integration test harness, or mocking `motor` / `aioredis` at import time in a `test_app.py` fixture.
 
-#### `app/analytics.py` — 95% (lines 46–47)
+#### `app/analytics.py` — 96% (lines 50–51)
 
-The `except (KeyError, ValueError): continue` branch inside `entries_for_date()` is not exercised. No test currently passes an entry with a valid-JSON body but a missing or unparseable `ts` field to `entries_for_date`.
+The `except (KeyError, ValueError): continue` branch inside `entries_for_date()` is not exercised. No test currently passes an entry with a valid-JSON body but a missing or unparseable `ts` field.
 
 **Fix:** Add a test case with `{"code": "x", "ip": "1.2.3.4"}` (no `ts` key) and verify it is skipped.
 
