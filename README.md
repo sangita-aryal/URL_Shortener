@@ -18,6 +18,7 @@ A stateless, distributed URL shortener engineered for high-throughput redirectio
 5. [Environment Variables](#5-environment-variables)
 6. [Running the Stack](#6-running-the-stack)
 7. [Frontend](#7-frontend)
+8. [Limitations and Trade-offs](#8-limitations-and-trade-offs)
 
 ---
 
@@ -495,3 +496,102 @@ npm run build
 ```
 
 Serve `frontend/dist/` from Nginx's root so the SPA and API share the same origin, eliminating CORS and the need for `VITE_API_BASE`.
+
+---
+
+## 8. Limitations and Trade-offs
+
+This section documents the known constraints of the current implementation — gaps between what the architecture specifies and what is actually deployed — and the trade-offs that were deliberately accepted.
+
+---
+
+### 8.1 Infrastructure — Single-Node Replica Set is Not Truly Highly Available
+
+The Compose stack runs MongoDB as a **single-node replica set** (`rs0` with one member). This was chosen because a standalone `mongod` does not support `w="majority"` write concerns, and a true multi-node replica set requires either multiple physical hosts or a complex single-host Compose configuration with named volumes per node.
+
+The consequence: if the `mongo` container crashes, the replica set has no secondary to elect as primary. Writes stall until the container restarts. The `restart: unless-stopped` policy mitigates this in practice, but the system is not HA in the production sense.
+
+**To make it genuinely HA:** deploy a three-member replica set across separate hosts, or use MongoDB Atlas, which manages replica membership automatically.
+
+---
+
+### 8.2 Redis — No Persistence, Data Lost on Restart
+
+Redis is configured with no `--appendonly` or `--save` flags (default: in-memory only). If the `redis` container is killed and restarted, the entire redirect cache is lost. The system remains **correct** — cache misses fall through to MongoDB — but redirect latency spikes until the cache is rebuilt by organic traffic.
+
+**Accepted trade-off:** cache warm-up time after restart vs. the operational complexity of configuring RDB snapshots or AOF persistence. For a read cache with immutable values, a cold start is safe; it is a latency event, not a correctness event.
+
+---
+
+### 8.3 Nginx — Manual Upstream Configuration Does Not Auto-Discover Replicas
+
+When scaling FastAPI with `docker compose up --scale fastapi=4`, Nginx resolves the upstream `server fastapi:8000` once at startup via Docker's embedded DNS. New containers started after Nginx has already launched are not automatically added to the upstream pool unless Nginx is reloaded (`nginx -s reload`).
+
+The current `nginx.conf` lists one upstream server. Adding replicas requires adding `server fastapi:8000` lines and reloading Nginx, or switching to a service mesh / dynamic upstream discovery mechanism (e.g., Nginx Plus, Consul, or an Envoy-based proxy).
+
+---
+
+### 8.4 Telemetry — IP-Based DAU Is an Approximation
+
+`compute_dau` counts unique source IPs per day. This produces a **lower bound**, not an exact unique-user count, for two reasons:
+
+1. **NAT and shared egress.** An entire office, university, or mobile carrier behind a single public IP appears as one user regardless of how many individuals click.
+2. **VPNs and proxies.** A single user switching VPN endpoints appears as multiple users.
+
+The telemetry pipeline captures `X-Real-IP` (set by Nginx from `$remote_addr`), which is the IP of the immediate TCP peer — the real client when accessed directly, but the proxy's IP when users are behind a forward proxy.
+
+**Accepted trade-off:** IP-based deduplication is simple and requires no user accounts or cookies. Exact unique-user counting would require either browser fingerprinting (privacy implications) or authentication (product scope change).
+
+---
+
+### 8.5 Telemetry — Fire-and-Forget Means Data Loss Is Possible
+
+`asyncio.create_task(telemetry.record_redirect(...))` schedules log writes asynchronously. All exceptions inside `record_redirect` are silently swallowed. This means:
+
+- If the log volume runs out of disk space, redirect events are silently dropped.
+- If the worker process is killed between the 302 response and the log write completing, the event is lost.
+- There is no dead-letter queue, retry mechanism, or alerting on telemetry write failures.
+
+**Accepted trade-off:** A failed telemetry write must not fail or delay a redirect. Availability of the core product feature takes precedence over telemetry completeness. At high QPS, the window between the 302 and the write completing is microseconds — loss rate in practice is negligible.
+
+---
+
+### 8.6 ID Generation — Lease Leakage Creates Gaps in the Sequence Space
+
+Each FastAPI worker claims a block of 10,000 sequence IDs from MongoDB at startup. If a worker is OOM-killed or evicted mid-lease, up to 9,999 IDs are permanently lost — never encoded into short codes, never stored in MongoDB. These gaps are **harmless for correctness** (the Feistel cipher remains bijective over the gaps) but mean the sequence counter advances faster than the URL count, narrowing the 3.5-trillion-key headroom over time.
+
+At 100M URL creations per day with a 10,000-ID lease and ten container restarts per day, worst-case leakage is ~99,990 IDs/day — less than 0.1% of daily capacity. Over the 10-year horizon, this is negligible.
+
+---
+
+### 8.7 SSRF — Validation Window Between DNS Resolution and MongoDB Write
+
+The SSRF validator resolves the target hostname at URL creation time. There is a small window — measured in milliseconds — between the DNS resolution completing and the URL being written to MongoDB. A sophisticated attacker controlling their DNS TTL could respond with a public IP during validation and rotate to a private IP afterwards (DNS rebinding).
+
+**Mitigation in place:** the SSRF check runs before any sequence ID is consumed. There is no subsequent re-validation on the redirect path. The redirect route reads the stored URL from MongoDB and issues a 302 directly; it does not re-resolve the destination hostname.
+
+**Residual risk:** a URL that was valid at creation time could, through DNS rebinding or destination-server-side redirects, eventually route a user's browser to an internal resource. The server itself is not the vector in this case — the user's browser is. This is a client-side risk outside the server's enforcement boundary.
+
+---
+
+### 8.8 Analytics — Offline Only, No Real-Time Dashboard
+
+The `AnalyticsConsumer` reads from the log file offline. There is no streaming aggregation, no real-time dashboard, and no alerting. Metrics are available only by running `docker compose --profile analytics run --rm analytics`, which produces a point-in-time report.
+
+**To add real-time analytics:** replace the file-append log with a message queue (Kafka, Redis Streams) and add a streaming consumer (Flink, Spark Structured Streaming, or a simple asyncio consumer). This was explicitly out of scope to avoid adding queue infrastructure to a system that already manages five containers.
+
+---
+
+### 8.9 No URL Expiration or Deletion
+
+Short codes are permanent. There is no TTL on URL documents in MongoDB and no `DELETE /shorten/{code}` endpoint. Redis cache entries are permanent until LRU eviction. A URL created today will remain resolvable indefinitely.
+
+**Accepted trade-off:** expiration requires either a background TTL-sweeper job (additional operational complexity) or MongoDB TTL indexes on a `created_at` field (not currently stored). Deletion requires an authenticated admin API (out of scope for this prototype). Permanence is the simpler and safer default for a prototype.
+
+---
+
+### 8.10 No HTTPS in the Compose Stack
+
+Nginx listens on port 80 (HTTP only). There is no TLS termination, no certificate management, and no HTTP→HTTPS redirect. All traffic between client and Nginx — including the full destination URL in `POST /shorten` request bodies — is transmitted in plaintext.
+
+**For production:** provision a TLS certificate (Let's Encrypt / ACM), add a `listen 443 ssl` block to `nginx.conf`, configure `ssl_certificate` and `ssl_certificate_key`, and add a port 80 → 443 redirect. Alternatively, terminate TLS at a cloud load balancer upstream of Nginx.
