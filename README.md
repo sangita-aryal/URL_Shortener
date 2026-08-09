@@ -151,6 +151,127 @@ Relevant source: [`app/ssrf_validator.py`](app/ssrf_validator.py) — `validate_
 
 ---
 
+### 4 — Redis Read-Through Cache (URL Persistence)
+
+**The problem.** Serving one billion redirects per day at ~11,600 QPS means
+the dominant operation is a key lookup by short code. Hitting MongoDB on
+every redirect would saturate the database's read capacity and add network
+round-trip latency to the hot path (target: sub-millisecond redirection).
+
+**The solution.** `URLRepository` implements a read-through cache pattern
+that keeps the hot path entirely in Redis RAM:
+
+```
+Write path — save(short_code, url)
+  insert_one → MongoDB (w="majority", j=True)
+  Redis is NOT touched. Cache population is strictly lazy.
+
+Read path — get(short_code)
+  1. redis.get(short_code)
+     ├─ HIT  → decode bytes → return URL  ← MongoDB never opened
+     └─ MISS → find_one({"_id": short_code})
+               ├─ FOUND     → redis.set(short_code, url) → return URL
+               └─ NOT FOUND → return None  (Redis NOT written)
+```
+
+**Why lazy population on the write path.** Writing to Redis on `save()`
+would couple the write-path latency to two sequential network calls (Mongo
++ Redis). Lazy population means only the first read miss pays that cost;
+every subsequent read for the same code is a sub-millisecond Redis hit.
+
+**Why not write `None` to Redis on a miss.** A short code that does not
+exist today may be created tomorrow. Caching `None` would serve stale
+404s until the TTL expires. The repository intentionally skips the Redis
+write on not-found.
+
+**Durability.** The MongoDB client is configured with `w="majority"` and
+`j=True`. No URL document is acknowledged until it is durably written to a
+majority of replica nodes and flushed to the journal, preventing data loss
+on a primary failover.
+
+**The call sequence is a first-class contract.** The interaction order
+`redis.get → mongo.find_one → redis.set` is enforced by `TestReadOrder`
+using a side-effect call log, not just presence/absence checks.
+
+Relevant source: [`app/url_repository.py`](app/url_repository.py) — `URLRepository`
+
+---
+
+### 5 — Async Telemetry Pipeline (File-Based, Not Redis)
+
+**The problem.** Buffering click analytics directly in Redis is an
+anti-pattern at this scale: every `INCR` or `PFADD` competes with the
+hot URL cache for RAM, forcing LRU evictions of frequently-redirected
+short codes. Evicting a hot URL from Redis turns a sub-millisecond cache
+hit into a full MongoDB round-trip — exactly the latency the cache exists
+to prevent.
+
+**The solution.** Each FastAPI worker appends structured JSON telemetry
+entries to a local append-only log file. An offline Python script
+(`app/analytics.py`) streams the log independently of the hot path.
+
+```
+Redirect request
+      │
+      ▼
+ repo.get() → 302 Response  ← returned to the caller immediately
+      │
+      └──▶ asyncio.create_task(telemetry.record_redirect(...))
+                │
+                ▼ (background — does not block the response)
+           asyncio.to_thread(_append)
+                │
+                ▼
+           /var/log/url_shortener_analytics.log
+           {"ts":"2026-08-09T10:00:00+00:00","code":"aB3cD4e","ip":"203.0.113.42"}
+           {"ts":"2026-08-09T10:00:01+00:00","code":"xY9zW1q","ip":"198.51.100.7"}
+           ...
+```
+
+**Why `asyncio.create_task`, not `await`.** The `create_task` call
+schedules the log write on the running event loop and returns
+immediately. The 302 response is transmitted to the client before the
+log entry hits disk. Even if the log write fails (disk full, missing
+directory), the exception is swallowed internally — telemetry loss is
+preferable to a failed redirect.
+
+**Why `asyncio.to_thread` inside the logger.** Python's built-in file
+I/O is blocking. Calling `open()` / `write()` directly in a coroutine
+would stall every other coroutine on the thread for the duration of the
+syscall. `asyncio.to_thread` offloads the write to the thread-pool
+executor, keeping the event loop free.
+
+**Offline analytics consumer.** `AnalyticsConsumer` reads the log file
+as a lazy generator — one line at a time, never the whole file — and
+computes two aggregates:
+
+| Method | Algorithm | Space |
+|---|---|---|
+| `compute_dau(entries)` | Insert each `ip` into a Python `set`; return `len(set)` | O(U) — unique users only |
+| `compute_total_clicks(entries)` | `collections.Counter` over `code` field | O(K) — unique short codes |
+
+`entries_for_date(log_path, target_date)` filters the stream to a single
+UTC date before aggregation, preventing yesterday's traffic from
+inflating today's DAU.
+
+Relevant sources:
+[`app/telemetry.py`](app/telemetry.py) — `TelemetryLogger` ·
+[`app/analytics.py`](app/analytics.py) — `AnalyticsConsumer`
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `MONGO_URI` | `mongodb://mongo:27017` | MongoDB connection string. Targets the `url_shortener` database. |
+| `REDIS_URI` | `redis://redis:6379` | Redis connection string. Used by `URLRepository` for the read-through cache. |
+| `BASE_URL` | `http://localhost` | Public base URL prepended to short codes in the `POST /shorten` response. |
+| `LOG_PATH` | `/var/log/url_shortener_analytics.log` | Append-only telemetry log written by `TelemetryLogger`. Feed this path to `AnalyticsConsumer` for offline DAU and click aggregation. |
+| `FEISTEL_KEY_0` – `FEISTEL_KEY_3` | `0xDEADBEEF`, `0xCAFEBABE`, `0x12345678`, `0xABCDEF01` | Four 32-bit Feistel round keys. Rotate per deployment to prevent short-code prediction. |
+
+---
+
 ## Running the Test Suite
 
 The test suite is written with `pytest` and `pytest-asyncio` following a
@@ -163,7 +284,7 @@ implementation code.
 pip install -r requirements.txt
 ```
 
-**Run the full suite (93 tests)**
+**Run the full suite (146 tests)**
 
 ```bash
 pytest tests/ -v
@@ -180,6 +301,8 @@ pytest tests/ -v -m "not slow"
 ```bash
 pytest tests/test_id_generator.py -v
 pytest tests/test_ssrf_validator.py -v
+pytest tests/test_url_repository.py -v
+pytest tests/test_telemetry.py -v
 ```
 
 ### Test coverage
@@ -205,3 +328,15 @@ pytest tests/test_ssrf_validator.py -v
 | | `TestForbiddenSchemes` | `file`, `ftp`, `javascript`, `data`, `gopher`, `dict`; case-insensitive |
 | | `TestMalformedURLs` | Empty string, whitespace, bare hostname, missing host |
 | | `TestDNSRebindingDefence` | DNS rebinding (hostname resolves to private IP); `aiodns.error.DNSError` → block |
+| `test_url_repository.py` | `TestWritePath` | `save()` calls `insert_one` once with `{"_id": code, "url": url}`; `redis.get` and `redis.set` are never called |
+| | `TestCacheHit` | Redis hit → URL decoded from bytes returned; `find_one` not called; `redis.set` not called; `redis.get` called with short code |
+| | `TestCacheMiss` | Redis miss → `find_one` called with `{"_id": code}`; URL returned; `redis.set` called once with `(code, url)` as positional args |
+| | `TestNotFound` | Both stores return nothing → `None` returned; `redis.set` never called (no null-cache poisoning) |
+| | `TestReadOrder` | Hit: `redis.get` called before `find_one` is ever reached; Miss: side-effect log asserts exact sequence `redis.get → mongo.find_one → redis.set` |
+| `test_telemetry.py` | `TestLogEntryFormat` | `record_redirect` writes exactly one valid JSON line per call containing `ts`, `code`, and `ip`; successive calls append without overwriting |
+| | `TestLogEntryTimestamp` | `ts` is ISO-8601 parseable; carries non-`None` UTC `tzinfo`; reflects today's UTC date |
+| | `TestAsyncAndErrorIsolation` | `record_redirect` is a coroutine function; calling it returns an awaitable; bad log path swallows `OSError`; healthy logger unaffected by a prior failure |
+| | `TestStreamEntries` | `stream_entries` is a generator; yields dicts; empty file → empty iterator; skips malformed JSON and blank lines; all three fields present per entry |
+| | `TestDAUComputation` | One IP → 1; same IP twice → 1 (dedup); two IPs → 2; empty → 0; 1,000 entries / 500 unique IPs → 500; return type is `int` |
+| | `TestClickComputation` | One click → 1; two clicks same code → 2; two codes counted independently; empty → `{}`; values are `int` |
+| | `TestDateIsolation` | Today's filter excludes yesterday; yesterday's filter excludes today; `entries_for_date` is a generator; full pipeline `entries_for_date → compute_dau` excludes prior-day IPs |

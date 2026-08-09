@@ -108,3 +108,34 @@ def url_repo(mock_urls_collection, mock_redis):
     """
     from app.url_repository import URLRepository
     return URLRepository(collection=mock_urls_collection, redis_client=mock_redis)
+
+
+# ── Telemetry / Analytics fixtures ───────────────────────────────────────────
+
+@pytest.fixture
+def log_path(tmp_path) -> str:
+    """
+    Ephemeral log file path inside pytest's tmp_path directory.
+    Each test gets a fresh, isolated file; pytest cleans it up automatically.
+    """
+    return str(tmp_path / "analytics.log")
+
+
+@pytest.fixture
+def telemetry_logger(log_path):
+    """
+    TelemetryLogger pointed at the ephemeral log file.
+    Import is deferred so conftest loads cleanly before app/telemetry.py exists.
+    """
+    from app.telemetry import TelemetryLogger
+    return TelemetryLogger(log_path=log_path)
+
+
+@pytest.fixture
+def analytics_consumer():
+    """
+    AnalyticsConsumer instance (stateless — no constructor args).
+    Import is deferred so conftest loads cleanly before app/analytics.py exists.
+    """
+    from app.analytics import AnalyticsConsumer
+    return AnalyticsConsumer()
