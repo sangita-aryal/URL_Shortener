@@ -1,0 +1,164 @@
+# ── URL Shortener — System Orchestration ────────────────────────────────────
+#
+# Network isolation contract (architect.md §2):
+#   • Nginx is the ONLY service with a host-mapped port (80).
+#   • FastAPI, Redis, and MongoDB are attached to the `internal` bridge
+#     network only.  They have no published ports and are unreachable
+#     from outside this Compose stack.
+#   • The network bridge flag is NOT set to `internal: true` so that
+#     FastAPI workers can make outbound aiodns calls for SSRF validation.
+#
+# Startup order:
+#   mongo → mongo-init → fastapi ←→ redis → nginx
+#
+# Telemetry volume:
+#   The `telemetry_logs` named volume is shared (read-write) by all
+#   FastAPI workers and mounted read-only by the analytics consumer.
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  mongo_data:
+    driver: local
+  telemetry_logs:
+    driver: local
+
+services:
+
+  # ── Layer 7 API Gateway ────────────────────────────────────────────────────
+  # The sole public-facing component.  Terminates external connections,
+  # applies rate limiting, and reverse-proxies to the FastAPI upstream.
+  # ──────────────────────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"                          # ← only public ingress point
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - internal
+    depends_on:
+      fastapi:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Application tier ───────────────────────────────────────────────────────
+  # Stateless FastAPI ASGI workers.  No host-mapped ports; reachable only
+  # from Nginx on the internal network.
+  # Scale with:  docker compose up --scale fastapi=4
+  # ──────────────────────────────────────────────────────────────────────────
+  fastapi:
+    build: .
+    networks:
+      - internal
+    environment:
+      MONGO_URI:     "mongodb://mongo:27017/?replicaSet=rs0"
+      REDIS_URI:     "redis://redis:6379"
+      BASE_URL:      "http://localhost"
+      LOG_PATH:      "/var/log/url_shortener_analytics.log"
+      # Feistel round keys — rotate these values per deployment to prevent
+      # short-code enumeration attacks.  Defaults match the test fixtures.
+      FEISTEL_KEY_0: "3735928559"        # 0xDEADBEEF
+      FEISTEL_KEY_1: "3405691582"        # 0xCAFEBABE
+      FEISTEL_KEY_2: "305419896"         # 0x12345678
+      FEISTEL_KEY_3: "2882400001"        # 0xABCDEF01
+    volumes:
+      - telemetry_logs:/var/log          # append-only telemetry log mount
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # ── Redis read-through cache ───────────────────────────────────────────────
+  # No host-mapped ports.  Accessible only on the internal network.
+  # ──────────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ── MongoDB data tier ──────────────────────────────────────────────────────
+  # Runs as a single-node replica set (rs0) so the Motor driver can honour
+  # the w="majority" + j=True write concern required by architect.md §5.
+  # A standalone mongod instance does not support majority write concerns.
+  # No host-mapped ports.  Accessible only on the internal network.
+  # ──────────────────────────────────────────────────────────────────────────
+  mongo:
+    image: mongo:7
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    networks:
+      - internal
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping').ok", "--quiet"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Replica-set initialiser ────────────────────────────────────────────────
+  # One-shot init container.  Runs after mongo is healthy, initiates the
+  # rs0 replica set, then exits 0.  FastAPI waits on service_completed_successfully
+  # so it never connects before the replica set is ready.
+  # The try/catch is idempotent: safe on stack restarts when the replica
+  # set is already initialised.
+  # ──────────────────────────────────────────────────────────────────────────
+  mongo-init:
+    image: mongo:7
+    networks:
+      - internal
+    depends_on:
+      mongo:
+        condition: service_healthy
+    command:
+      - mongosh
+      - --host
+      - mongo:27017
+      - --eval
+      - |
+        try {
+          rs.status();
+          print('Replica set already initialised — skipping.');
+        } catch(e) {
+          rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'mongo:27017' }] });
+          print('Replica set initialised.');
+        }
+    restart: "no"
+
+  # ── Offline analytics consumer (opt-in) ───────────────────────────────────
+  # Not started by default.  Run on demand to produce a DAU + click report
+  # for today (or a specific date) from the shared telemetry log volume.
+  #
+  # Usage:
+  #   docker compose --profile analytics run --rm analytics
+  #   docker compose --profile analytics run --rm -e "TOP_N=50" analytics
+  #   docker compose --profile analytics run --rm analytics --date 2026-08-09
+  # ──────────────────────────────────────────────────────────────────────────
+  analytics:
+    build: .
+    profiles:
+      - analytics
+    networks:
+      - internal
+    volumes:
+      - telemetry_logs:/var/log:ro      # read-only — consumer never writes
+    entrypoint: ["python3", "scripts/report.py"]
+    restart: "no"
