@@ -11,7 +11,7 @@ Per architect.md §3:
 
   SequenceLeaseManager
     Contacts MongoDB via find_one_and_update to atomically acquire a block of
-    1,000,000 sequential IDs.  Subsequent calls within that block must resolve
+    10,000 sequential IDs.  Subsequent calls within that block must resolve
     in O(1) memory without touching the database mock again.
 
   IDGenerator  (integration)
@@ -164,7 +164,7 @@ class TestFeistelCipherRoundCount:
 class TestSequenceLeaseManagerDBInteraction:
     """
     Prove that the manager performs exactly one find_one_and_update call to
-    acquire a block of 1,000,000 IDs, and does not call it again until the
+    acquire a block of 10,000 IDs, and does not call it again until the
     entire block is exhausted.
     """
 
@@ -223,7 +223,7 @@ class TestSequenceLeaseManagerDBInteraction:
 
         _, kwargs = mock_collection.find_one_and_update.call_args
         update_doc = kwargs.get("update") or mock_collection.find_one_and_update.call_args[0][1]
-        # The $inc value must equal the default LEASE_SIZE (1,000,000).
+        # The $inc value must equal the default LEASE_SIZE (10,000).
         inc_value = update_doc["$inc"]["seq"]
         assert inc_value == SequenceLeaseManager.DEFAULT_LEASE_SIZE
 
@@ -238,22 +238,24 @@ class TestSequenceLeaseManagerOOneComplexity:
         await lease_manager.next_id()
         mock_collection.find_one_and_update.reset_mock()
 
-        # Time 10,000 in-lease calls; they must all be pure memory ops.
+        # Time 5,000 in-lease calls; they must all be pure memory ops.
+        # (The warm-up call above consumed 1 ID from the 10,000-ID lease,
+        # leaving 9,999 remaining — 5,000 stays comfortably within that block.)
         start = time.perf_counter()
-        for _ in range(10_000):
+        for _ in range(5_000):
             await lease_manager.next_id()
         elapsed = time.perf_counter() - start
 
         mock_collection.find_one_and_update.assert_not_called()
         assert elapsed < 1.0, (
-            f"10,000 in-lease next_id() calls took {elapsed:.3f}s; "
+            f"5,000 in-lease next_id() calls took {elapsed:.3f}s; "
             "expected sub-second O(1) memory increments"
         )
 
 
 class TestSequenceLeaseManagerConstants:
-    def test_default_lease_size_is_one_million(self):
-        assert SequenceLeaseManager.DEFAULT_LEASE_SIZE == 1_000_000
+    def test_default_lease_size_is_ten_thousand(self):
+        assert SequenceLeaseManager.DEFAULT_LEASE_SIZE == 10_000
 
 
 # ══════════════════════════════════════════════════════════════════════════════

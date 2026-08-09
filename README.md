@@ -106,6 +106,38 @@ primary failover.
 
 Relevant source: [`app/id_generator.py`](app/id_generator.py) — `SequenceLeaseManager`
 
+#### Architectural Trade-off: Lease Size
+
+The `DEFAULT_LEASE_SIZE` is set to **10,000** (not 1,000,000).
+
+A larger block reduces database round-trips further, but introduces a
+crash-leakage problem. FastAPI workers run inside stateless containers that can
+be killed at any time — by an OOM killer, a rolling deployment, or a
+node preemption. When a worker is killed mid-lease, every ID it claimed but
+never used is permanently lost; those sequence numbers will never be encoded
+into a short code, creating gaps in the ID space.
+
+With a lease of 1,000,000 a single OOM kill can leak up to 999,999 IDs. Over
+time, on a fleet of containers subject to regular restarts, this leakage
+accumulates and pushes the global counter far ahead of the number of URLs
+actually created — wasting a non-trivial portion of the 3.52 trillion available
+key space.
+
+Reducing the lease to 10,000 caps worst-case leakage at 9,999 IDs per
+crash — a **99% reduction** — while the resulting database load remains
+completely trivial:
+
+| Metric | Value |
+|---|---|
+| Daily URL creations (target) | 100,000,000 |
+| Lease size | 10,000 |
+| Maximum MongoDB lease fetches per day | 10,000 |
+| Comparison: MongoDB write capacity | millions of ops/day |
+
+10,000 `find_one_and_update` calls per day is negligible against the
+database's capacity. The durability guarantee (`w="majority"`, `j=True`) is
+preserved on every one of those calls.
+
 ---
 
 ### 3 — Non-Blocking aiodns SSRF Shield
