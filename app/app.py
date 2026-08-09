@@ -16,11 +16,13 @@ from typing import Annotated
 
 import aiodns
 import motor.motor_asyncio
+import redis.asyncio as aioredis
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from app.id_generator import FeistelCipher, IDGenerator, SequenceLeaseManager
 from app.ssrf_validator import SSRFValidationError, validate_url
+from app.url_repository import URLRepository
 
 # ── Feistel round keys ────────────────────────────────────────────────────────
 # Load from environment so each deployment can rotate keys without a rebuild.
@@ -33,6 +35,7 @@ _FEISTEL_KEYS: list[int] = [
 ]
 
 _MONGO_URI: str = os.environ.get("MONGO_URI", "mongodb://mongo:27017")
+_REDIS_URI: str = os.environ.get("REDIS_URI", "redis://redis:6379")
 _BASE_URL: str = os.environ.get("BASE_URL", "http://localhost")
 
 
@@ -53,13 +56,19 @@ async def lifespan(app: FastAPI):
     )
     db = mongo["url_shortener"]
 
+    redis_client = aioredis.from_url(_REDIS_URI, decode_responses=False)
+
     app.state.resolver = aiodns.DNSResolver()
     app.state.cipher = FeistelCipher(keys=_FEISTEL_KEYS)
     app.state.lease_manager = SequenceLeaseManager(collection=db["sequence"])
-    app.state.urls = db["urls"]
+    app.state.url_repo = URLRepository(
+        collection=db["urls"],
+        redis_client=redis_client,
+    )
 
     yield
 
+    await redis_client.aclose()
     mongo.close()
 
 
@@ -90,15 +99,15 @@ def get_id_generator(
     return IDGenerator(lease_manager=lease_manager, cipher=cipher)
 
 
-def get_urls(request: Request):
-    return request.app.state.urls
+def get_url_repo(request: Request) -> URLRepository:
+    return request.app.state.url_repo
 
 
 # ── Convenience type aliases for route signatures ─────────────────────────────
 
 ResolverDep = Annotated[aiodns.DNSResolver, Depends(get_resolver)]
-IDGenDep = Annotated[IDGenerator, Depends(get_id_generator)]
-UrlsDep = Annotated[object, Depends(get_urls)]
+IDGenDep    = Annotated[IDGenerator,         Depends(get_id_generator)]
+RepoDep     = Annotated[URLRepository,       Depends(get_url_repo)]
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -119,7 +128,7 @@ async def shorten_url(
     body: ShortenRequest,
     resolver: ResolverDep,
     id_gen: IDGenDep,
-    urls: UrlsDep,
+    repo: RepoDep,
 ) -> ShortenResponse:
     """
     Write path: validate the target URL, generate a short code, persist.
@@ -133,7 +142,7 @@ async def shorten_url(
         raise HTTPException(status_code=400, detail=str(exc))
 
     short_code = await id_gen.generate()
-    await urls.insert_one({"_id": short_code, "url": body.url})
+    await repo.save(short_code, body.url)
 
     return ShortenResponse(
         short_code=short_code,
@@ -142,15 +151,16 @@ async def shorten_url(
 
 
 @app.get("/{short_code}")
-async def redirect(short_code: str, urls: UrlsDep) -> Response:
+async def redirect(short_code: str, repo: RepoDep) -> Response:
     """
     Read path: look up the original URL and return HTTP 302.
 
-    The stored URL string is placed directly in the Location header;
-    no server-side fetch is performed (preserves SNI / CDN compatibility
-    and avoids a secondary SSRF surface as noted in architect.md §4).
+    URLRepository applies the read-through cache (Redis first, then
+    MongoDB on a miss with lazy Redis population).
+    The URL is placed directly in the Location header — no server-side
+    fetch avoids a secondary SSRF surface (architect.md §4).
     """
-    doc = await urls.find_one({"_id": short_code})
-    if doc is None:
+    url = await repo.get(short_code)
+    if url is None:
         raise HTTPException(status_code=404, detail="Short code not found")
-    return Response(status_code=302, headers={"Location": doc["url"]})
+    return Response(status_code=302, headers={"Location": url})

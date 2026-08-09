@@ -70,3 +70,41 @@ def mock_resolver() -> AsyncMock:
     resolver = AsyncMock()
     resolver.gethostbyname.return_value = make_aiodns_result("93.184.216.34")
     return resolver
+
+
+# ── URLRepository fixtures ────────────────────────────────────────────────────
+
+@pytest.fixture
+def mock_redis() -> AsyncMock:
+    """
+    Async mock of a redis.asyncio.Redis client.
+    Default: cache miss (get returns None).
+    Individual tests override return_value or side_effect as needed.
+    """
+    client = AsyncMock()
+    client.get.return_value = None   # default: cache miss
+    client.set.return_value = True
+    return client
+
+
+@pytest.fixture
+def mock_urls_collection() -> AsyncMock:
+    """
+    Async mock of the Motor 'urls' MongoDB collection.
+    Separate from mock_collection (which drives the sequence counter).
+    Default: document not found (find_one returns None).
+    """
+    col = AsyncMock()
+    col.find_one.return_value = None
+    col.insert_one.return_value = AsyncMock()
+    return col
+
+
+@pytest.fixture
+def url_repo(mock_urls_collection, mock_redis):
+    """
+    URLRepository wired with mocked MongoDB collection and Redis client.
+    Import is deferred so collection succeeds before app/url_repository.py exists.
+    """
+    from app.url_repository import URLRepository
+    return URLRepository(collection=mock_urls_collection, redis_client=mock_redis)

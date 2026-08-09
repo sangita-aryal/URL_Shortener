@@ -29,3 +29,10 @@ Before writing any feature code, you must first write the unit and integration t
     *   Write tests to validate the telemetry aggregation logic.
 2.  **Implement Features:** Only after generating the tests should you write the implementation code (`app.py`, `nginx.conf`, etc.) to make the tests pass.
 3.  **Orchestration:** Finalize the setup by writing a `docker-compose.yml` that enforces the private network isolation.
+
+
+## Documentation Automation Rules
+- **Rule**: You must update `README.md` immediately after completing any new feature or architectural change.
+- **Scope**: Include new installation steps, modified environment variables, new CLI flags, and API endpoint updates.
+- **Style**: Maintain the existing file structure, tone, and formatting conventions of the document.
+- **Verification**: Verify that instructions remain clear and functional before concluding the task.
