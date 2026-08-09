@@ -1,465 +1,470 @@
 # AI Execution Log — URL Shortener
 
 **Project:** URL Shortener  
-**Repository:** URL_Shortener  
 **AI Assistant:** Claude Sonnet 4.6 (Anthropic)  
 **Log Date:** 2026-08-09  
-**Total PRs merged:** 9 (branches `sangita-aryal/feature/*`)  
-**Total commits:** 20 (including merges, reverts, and patches)
+**Source:** Extracted verbatim from local Claude Code session transcripts  
+**Sessions:** `cecc4e25` (core build), `a6e7b415` (traceability + quality gates)  
+**Total PRs merged:** 9  
+**Quality gate artifacts:** [`docs/quality_gates.md`](quality_gates.md) on `feature/quality_gates`
 
-This document traces every major decision across the project lifecycle: what AI proposed, what was accepted unchanged, what was revised, what was rejected outright, and what alternatives were evaluated and discarded before a final design was chosen. It is intended as an auditable record of human–AI collaboration for accountability, reproducibility, and future architectural review.
-
----
-
-## How to read this document
-
-Each entry is structured as:
-
-- **AI proposed** — the design or implementation AI introduced
-- **Accepted as-is** — proposals the team adopted without modification
-- **Rejected** — proposals that were explicitly discarded (with the rejection commit or reason)
-- **Modified before acceptance** — proposals that were partially revised
-- **Alternatives AI evaluated and discarded** — options AI explicitly ruled out before writing any code
-- **Bugs AI introduced** — errors in AI-generated code that required a follow-up fix
+This document traces every major decision across the project lifecycle using **actual prompts extracted verbatim from the session transcripts**. Each entry shows: the exact prompt text, what AI proposed, what was accepted, what was rejected or modified, and bugs introduced by AI-generated code.
 
 ---
 
-## Entry 1 — Feistel Cipher & Distributed ID Generation
+## How to Read This Document
 
-**Files:** [`app/id_generator.py`](../app/id_generator.py), [`tests/test_id_generator.py`](../tests/test_id_generator.py), [`tests/conftest.py`](../tests/conftest.py)  
-**Initial commit:** `573dd0e` (PR #1)  
-**Revised:** `bed7773` (lease size), `42fee0d` (docs)
+Each entry records the **full prompt exchange** for that task:
+
+1. **Prompt(s) — Verbatim** — the exact text sent to AI, including any mid-task corrections
+2. **Alternatives AI evaluated and discarded** — options ruled out before writing code
+3. **AI proposed** — the design and implementation AI produced
+4. **Accepted as-is** — proposals adopted without modification
+5. **Modified before acceptance** — proposals that were partially revised
+6. **Rejected** — proposals explicitly discarded
+7. **Bugs AI introduced** — errors in AI-generated code requiring a follow-up fix
+
+Where a task required multiple turns (initial brief → rejection → revised constraints → approval), all turns are shown in sequence so the reader can see the correction loop.
 
 ---
 
-### Alternatives AI Evaluated and Discarded
+## Entry 1 — Distributed ID Generation (Feistel Cipher + Sequence Leasing)
 
-Before writing a single line of implementation, AI considered three canonical approaches and documented why each was incompatible with the system's requirements. These were later formalized in commit `304a6b3`, then pulled out of the README into this document (see [Rejected — "Evaluated Alternatives" README section](#rejected--evaluated-alternatives-readme-section) below).
+**Files:** [`app/id_generator.py`](../app/id_generator.py), [`tests/test_id_generator.py`](../tests/test_id_generator.py)  
+**Commits:** `573dd0e` (initial implementation), `bed7773` (lease size revision)  
+**Branch:** `feature/core-logic`
 
-#### Discarded: Relational DB Auto-Increment + Multi-Master Replication
+---
 
-The most commonly taught approach is a single auto-incrementing primary key in a relational database, with multi-master step replication to distribute writes (Server A issues 1, 3, 5 …; Server B issues 2, 4, 6 …).
+### Prompts — Verbatim (4 turns)
 
-**Reasons discarded:**
+**Turn 1 — Initial brief:**
+> Read claude.md. We are building a URL Shortener using strict Test-Driven Development. Your first task is to write the pytest and pytest-asyncio suite for the Distributed ID Generation and the SSRF validation logic. Do not write the implementation code (app.py) until I approve the tests.
 
-1. **Enumeration vulnerability.** Sequential IDs are trivially guessable. An attacker knowing one valid short code can iterate every URL ever created by incrementing. There is no cryptographic barrier between one valid code and all of them.
-2. **Multi-master rigidity.** The step size must be fixed at cluster inception. Adding or removing a node mid-operation requires a coordinated migration; the scheme does not preserve chronological ordering across nodes; and operationally it is brittle in ways that conflict with the system's stateless scaling model.
+**Turn 2 — Rejection + architectural correction (after AI produced a Snowflake-based design):**
+> Your test structure is comprehensive, but the underlying contracts violate our high-throughput and scaling mandates. You fell into standard monolithic defaults.
+> I have attached `architect.md`. Read it carefully and completely rewrite the test plan to enforce the following corrections:
+>
+> 1. Scrap the Snowflake ID Generator: Remove the timestamp and `worker_id` logic. The ID generation tests must strictly validate two separate components:
+>    * A `FeistelCipher` class: Write a test proving that a 42-bit integer encrypted and decrypted through 4 rounds returns the original integer (Bijective Reversibility).
+>    * A `SequenceLeaseManager`: Write a test that mocks MongoDB's `find_one_and_update`. Prove that the application fetches a block of 1,000,000 IDs once, and subsequent calls increment a local counter in O(1) time without hitting the database mock again.
+> 2. Scrap Synchronous DNS: Do not use or patch `socket.getaddrinfo`. This blocks ASGI event loops. Update your SSRF validator tests to explicitly mock and assert the use of `aiodns` for non-blocking asynchronous domain resolution.
+> 3. Output: Provide the updated test files (`test_id_generator.py` and `test_ssrf_validator.py`) based on these strict constraints.
+
+**Turn 3 — Partial approval + implementation request:**
+> These tests are excellent and correctly enforce the mathematical and asynchronous constraints, however, you dropped the integration tests for final Base-62 output.
+>
+> 1. Quickly add a TestIDGenerator class that integrates the SequenceLeaseManager and FeistelCipher to prove the final output is a 7 character long Base-62 string.
+> 2. Once that is added, consider the test suite approved
+> 3. The core logic tests are approved. Now write the implementation code (app.py, id_generator.py, ssrf_validator.py) to make these exact tests pass. Ensure the FastAPI workers remain 100% stateless.
+> 4. Design Pattern Mandates:
+>    1. Strict Separation of Concerns: Business logic (the cipher and validation math) must be completely decoupled from the HTTP routing in `app.py`.
+>    2. Dependency Injection: You must use FastAPI's `Depends()` to inject the `SequenceLeaseManager` and `aiodns` resolver into the route handlers. Do not use global state variables for these dependencies. This ensures the mocked objects from our tests can be cleanly injected.
+>    3. Stateless Compute: Ensure the FastAPI workers remain 100% stateless in memory.
+
+**Turn 4 — Lease size revision (separate session, after push to feature/core-logic):**
+> We need to make an architectural adjustment to our ID generation logic to optimize for fault tolerance.
+>
+> 1. Code and Test update: Change the DEFAULT_LEASE_SIZE for the MongoDB range pre-allocation from 1,000,000 to 10,000. Update this constant in both app/id_generator.py and test/tests_id_generator.py. Ensure you also fix specific test that assert the old 1,000,000 increment value.
+> 2. README update: Add a new sub-section to the README.md under the distributed ID Generation heading title "Architectural Trade-off: Lease Size"
+> 3. Documentation Details: In that new section, explicitly document why we made this change. Explain that pulling massive blocks of 1,000,000 IDs risk significant ID leakage if a stateless worker container crashes (e.g., an OOM Kill) before utilizing them. By reducing the lease size to 10,000, we minimize crash leakage by 99% while the resulting database load remains completely trivial (only 10,000 document updates per day to sustain 100 million daily URL creations).
+
+---
+
+### What AI Got Wrong First (and What the User Caught)
+
+The initial Turn 1 response produced a **Snowflake ID generator** — a timestamp-based design (64-bit with millisecond timestamp, worker ID, and sequence number). The user identified this as the wrong architecture because:
+
+- Snowflake IDs are timestamp-encoded and therefore **enumerable** — attackers can infer creation time and iterate through adjacent IDs
+- Snowflake requires clock synchronisation across workers and is sensitive to NTP drift
+- The initial SSRF tests mocked `socket.getaddrinfo` — a **synchronous blocking syscall** that stalls the ASGI event loop
+
+The user attached `architect.md`, specified the Feistel cipher and `aiodns` requirements explicitly, and required a full rewrite. Turn 2 was the corrective prompt; Turn 3 granted approval after a further gap (missing Base-62 integration tests) was caught by the user.
+
+---
+
+### Alternatives AI Evaluated and Discarded (after Turn 2 re-orientation)
+
+#### Discarded: Snowflake / Timestamp-based IDs
+The initial AI default. Enumerable by design — timestamp component reveals creation order and lets an attacker iterate valid IDs. Clock-skew sensitive. Rejected by the user in Turn 2.
+
+#### Discarded (from architect.md): Relational DB Auto-Increment + Multi-Master
+Sequential IDs are trivially enumerable. Multi-master step increments (Server A: odd, Server B: even) are operationally rigid — node add/remove requires coordinated migration; chronological ordering breaks across nodes.
 
 #### Discarded: MD5/SHA-256 Hash Truncation
-
-Hashing the destination URL and truncating to 7 characters is stateless and requires no coordination.
-
-**Reasons discarded:**
-
-1. **Birthday-paradox collision.** A 7-character truncation retains only 41 bits of the original digest. By the birthday paradox, collision probability reaches 50% after approximately **1.5 million URLs** — far below the system's 365-billion-record 10-year horizon.
-2. **Read-before-write penalty.** Each collision requires a round-trip to the database to check whether the hash slot is occupied, then a retry with a salt or counter. This doubles write-path latency in the common case and introduces an unbounded retry loop in the worst case — directly violating the low-latency write requirement.
+7-character truncation retains ~41 bits. Birthday paradox: 50% collision probability after ~1.5 million URLs. Each collision requires a read-before-write round-trip, violating the zero-read-before-write mandate.
 
 #### Discarded: UUID v4
-
-UUID v4 is collision-resistant in practice but is **36 characters long** (e.g., `550e8400-e29b-41d4-a716-446655440000`). A full UUID as a short code produces URLs longer than most destination URLs, defeating the product requirement. Truncating a UUID to 7 characters strips its collision-resistance and reintroduces the birthday-paradox collision risk described above.
+36 characters. Truncating to 7 characters strips collision resistance.
 
 ---
 
-### AI Proposed
+### AI Proposed (after Turn 2)
 
-A three-layer pipeline: `SequenceLeaseManager → FeistelCipher → Base-62 encoder`.
+Three-layer pipeline: `SequenceLeaseManager → FeistelCipher → Base-62 encoder`.
 
-**FeistelCipher** — 42-bit, 4-round balanced Feistel network. Splits each integer into two 21-bit halves and applies four keyed mixing rounds. The Feistel structure guarantees bijectivity (injectivity + surjectivity) structurally — for any round function, `decrypt(encrypt(x)) == x` for all `x ∈ [0, 2^42)`. Round keys loaded from environment variables.
-
-**SequenceLeaseManager** — Atomically acquires a block of sequential IDs from MongoDB via a single `find_one_and_update` with `$inc`. All subsequent IDs within that block are pure in-memory increments. An `asyncio.Lock` serialises concurrent coroutines within a single worker.
-
-**IDGenerator** — Thin integration: `seq_id → cipher.encrypt(seq_id) → Base-62 encode`. Cycle-walking handles the domain mismatch between Feistel's `[0, 2^42)` and Base-62's `[0, 62^7)`: if the output exceeds `62^7 - 1`, follow the permutation chain until it lands in range. Guaranteed termination because the cipher is a bijection of a finite set.
-
-**42-bit domain rationale:** `62^7 = 3,521,614,606,208 ≈ 2^41.7`. Choosing 42 bits means two symmetric 21-bit halves, which is required for a balanced Feistel; 41 bits would produce asymmetric 20-/21-bit halves.
-
-**Initial lease size proposed:** `DEFAULT_LEASE_SIZE = 1_000_000`
+- **FeistelCipher**: 42-bit, 4-round balanced Feistel network. Bijectivity is structural — guaranteed by the Feistel construction independent of the round function. Cycle-walking handles the domain mismatch between `[0, 2^42)` and `[0, 62^7)`.
+- **SequenceLeaseManager**: Single atomic `find_one_and_update` with `$inc` claims a block; subsequent IDs are pure in-memory increments. `asyncio.Lock` serialises concurrent coroutines.
+- **IDGenerator**: Stateless shim wiring the two components; constructed per-request via `Depends()`.
+- **Initial lease size proposed**: `DEFAULT_LEASE_SIZE = 1_000_000`
 
 ---
 
 ### Accepted as-is
 
-| Item | Why accepted |
+| Item | Acceptance rationale |
 |---|---|
-| 4-round Feistel cipher | Bijectivity proven structurally; 4 rounds provides strong dispersion with minimal fixed-point risk |
-| 42-bit / 21-bit symmetric halves | Mathematically correct split for a balanced Feistel; matches 7-char Base-62 keyspace |
-| Cycle-walking FPE for domain mismatch | No wasted sequence IDs; terminates because permutation is finite; simpler than rejection sampling |
-| `asyncio.Lock` for lease serialisation | Correct concurrency primitive for a single asyncio event loop per Uvicorn worker |
-| Round keys from environment variables | Allows per-deployment key rotation without an image rebuild, preventing short-code enumeration across deployments |
-| `IDGenerator` constructed per-request | Stateless shim; stateful `SequenceLeaseManager` is the singleton; cheap to instantiate |
-| Contract-first TDD for all 30+ tests | Established correctness guarantees (bijectivity, non-collision, O(1) complexity) before implementation existed |
+| 4-round, 42-bit Feistel cipher | Bijectivity proven structurally; 42-bit symmetric halves cover 62^7 space; 4 rounds provides strong dispersion |
+| Cycle-walking for domain mismatch | No wasted sequence IDs; terminates because permutation is a bijection of a finite set |
+| `asyncio.Lock` for lease serialisation | Correct primitive for single-event-loop concurrency |
+| Round keys from environment variables | Per-deployment key rotation prevents short-code enumeration across deployments |
+| `IDGenerator` constructed per-request | Stateful singleton is `SequenceLeaseManager`; IDGenerator is a thin cheap shim |
+| Contract-first TDD for all 30+ tests | Correctness properties verified before implementation exists |
 
 ---
 
 ### Modified Before Acceptance — Lease Size: 1,000,000 → 10,000
 
-**Commit:** `bed7773`  
-**Original proposal:** `DEFAULT_LEASE_SIZE = 1_000_000`
+**User-initiated in Turn 4.** AI had proposed `DEFAULT_LEASE_SIZE = 1_000_000`. The user identified the fault-tolerance problem and specified the exact target value and the documentation language.
 
-After the initial implementation landed, AI raised a fault-tolerance concern: Uvicorn workers run inside stateless containers subject to OOM kills, rolling deployments, and node preemptions. When a worker is killed mid-lease, every claimed-but-unused ID is permanently lost — creating gaps in the sequence space.
-
-With a lease of 1,000,000, a single OOM kill can permanently leak up to **999,999 IDs**. Over a fleet of containers with regular restarts, this leakage accumulates and pushes the global counter far ahead of the number of URLs actually created.
-
-**Revised to:** `DEFAULT_LEASE_SIZE = 10_000`
-
-| Metric | Value |
-|---|---|
-| Worst-case leak per crash (1M lease) | 999,999 IDs |
-| Worst-case leak per crash (10K lease) | 9,999 IDs — **99% reduction** |
-| Daily lease fetches at 100M creations/day | 10,000 MongoDB round-trips — negligible |
-
-**Cascading test changes required by this revision:**
-- `TestSequenceLeaseManagerConstants`: `test_default_lease_size_is_one_million` → `test_default_lease_size_is_ten_thousand`
-- `TestSequenceLeaseManagerOOneComplexity`: inner loop reduced from 10,000 to 5,000 iterations to stay within a single 10,000-ID lease after the warm-up call consumed the first ID
-
----
-
-### Rejected — "Evaluated Alternatives" README Section
-
-**Commit added:** `304a6b3`  
-**Commit reverted:** `cda7695` (1 minute 42 seconds later)
-
-AI added a 48-line "Evaluated Alternatives & Trade-offs" section to `README.md` covering the three discarded alternatives above. The section was immediately reverted. The rationale: alternatives analysis belongs in an AI traceability document (this file), not in the user-facing README, which should focus on how to use and operate the system rather than on the design process.
-
-**Content preserved here** rather than in README.
+| Lease size | Max IDs leaked per crash | MongoDB fetches/day at 100M writes |
+|---|---|---|
+| 1,000,000 | 999,999 | 100 |
+| **10,000** | **9,999 (99% reduction)** | **10,000 (negligible)** |
 
 ---
 
 ## Entry 2 — SSRF Validator
 
 **Files:** [`app/ssrf_validator.py`](../app/ssrf_validator.py), [`tests/test_ssrf_validator.py`](../tests/test_ssrf_validator.py)  
-**Initial commit:** `573dd0e` (PR #1)
+**Commit:** `573dd0e` (same commit as Entry 1)  
+**Branch:** `feature/core-logic`
+
+---
+
+### Prompts — Verbatim
+
+SSRF validation was specified **within the same prompt chain as Entry 1**. The core constraints were set in Turn 2:
+
+> Scrap Synchronous DNS: Do not use or patch `socket.getaddrinfo`. This blocks ASGI event loops. Update your SSRF validator tests to explicitly mock and assert the use of `aiodns` for non-blocking asynchronous domain resolution.
+
+Implementation was authorised in Turn 3 alongside the ID generator:
+
+> Now write the implementation code (app.py, id_generator.py, ssrf_validator.py) to make these exact tests pass.
 
 ---
 
 ### Alternatives AI Evaluated and Discarded
 
-#### Discarded: `socket.getaddrinfo` for DNS Resolution
+#### Discarded: `socket.getaddrinfo` for DNS resolution
+The initial Turn 1 design used this. Synchronous blocking syscall — stalls the entire ASGI event loop for 50–300 ms per write-path request. Rejected by the user in Turn 2 by name.
 
-`socket.getaddrinfo` is the standard Python DNS function and would have been the most natural choice.
+#### Discarded: Fail-open on DNS errors
+Unresolvable ≠ safe. An attacker controlling internal DNS can return NXDOMAIN for a name that resolves to a private IP within the internal network only. Fail-open policy is exploitable to bypass the shield.
 
-**Reason discarded:** `socket.getaddrinfo` is a synchronous blocking syscall. On an ASGI event loop it stalls every concurrent coroutine for the entire duration of the DNS round-trip (50–300 ms typical under load). With 11,600 read QPS, stalling the event loop on every write-path DNS lookup would saturate workers and cascade into redirect latency degradation.
+#### Discarded: Domain allowlist
+Severely limits product utility; requires constant maintenance; does not prevent DNS rebinding on allowlisted domains.
 
-**Chosen instead:** `aiodns.DNSResolver.gethostbyname()` — wraps the c-ares async resolver; the coroutine yields to the event loop while the DNS query is in flight, allowing concurrent requests to proceed unimpeded.
-
-#### Discarded: Fail-Open on DNS Errors
-
-An alternative policy would be to permit URLs when DNS resolution fails (e.g., timeout, NXDOMAIN), on the grounds that an unresolvable hostname can't be reached anyway.
-
-**Reason discarded:** Unresolvable ≠ safe. An attacker controlling internal DNS can return NXDOMAIN for a hostname that resolves to a private IP only within the internal network — exploiting the fail-open policy to smuggle a private-IP target through validation. AI chose **fail-closed**: any DNS error is treated as a block. Telemetry loss from a failed redirect is less harmful than a successful SSRF.
-
-#### Discarded: Allowlisting Specific Public Domains
-
-Maintaining an allowlist of permitted domains (e.g., `*.github.com`, `*.twitter.com`) and rejecting everything else.
-
-**Reason discarded:** Severely limits the product utility (a URL shortener that only accepts GitHub/Twitter URLs is not general-purpose), requires constant maintenance, and still doesn't protect against DNS rebinding on allowlisted domains. The denylist approach (block private ranges, permit everything else) is more defensible and scales to arbitrary public URLs.
-
-#### Discarded: Server-Side Prefetch for Redirect Validation
-
-Fetching the destination URL server-side on every redirect to verify it's safe before issuing the 302.
-
-**Reason discarded:** Would introduce a secondary SSRF surface on the read path. A URL that was valid at creation time could later be updated (via DNS change or server-side redirect chain) to point to an internal resource. More critically, it would make the redirect path dependent on outbound HTTP latency rather than an in-memory cache lookup. AI explicitly called this out in the `app/app.py` route comment: "The URL is placed directly in the Location header — no server-side fetch avoids a secondary SSRF surface."
+#### Discarded: Server-side prefetch on the redirect path
+Creates a secondary SSRF surface. Also makes the read path (11,600 QPS) dependent on outbound HTTP latency.
 
 ---
 
 ### AI Proposed
 
-A six-step validation pipeline executed on every `POST /shorten` before any sequence ID is consumed:
+Six-step validation pipeline:
 
-1. **Empty/whitespace guard** — reject blank input before any parsing
-2. **Scheme allowlist** — only `http` and `https`; case-insensitive; all other schemes (`file://`, `ftp://`, `javascript:`, `data:`, `gopher://`, `dict://`) blocked
-3. **Host extraction** — `urlparse.hostname` (auto-lowercased, IPv6 brackets stripped)
-4. **Hostname denylist** — `localhost` blocked by string match regardless of what it resolves to
-5. **Literal IP fast-path** — if host parses as `ipaddress.ip_address`, range-check directly; skip DNS. Handles IPv4-mapped IPv6 (`::ffff:192.168.1.1`) and zone-ID stripping (`fe80::1%25eth0`)
-6. **Async DNS resolution** — `aiodns.DNSResolver.gethostbyname(host, AF_INET)`; all resolved addresses range-checked; DNS error treated as block
-
-**Blocked ranges:**
-
-| Range | Type |
-|---|---|
-| `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | RFC 1918 private |
-| `127.0.0.0/8` | IPv4 loopback |
-| `169.254.0.0/16` | Link-local / AWS EC2 metadata |
-| `::1/128` | IPv6 loopback |
-| `fe80::/10` | IPv6 link-local |
-| `fc00::/7` | IPv6 unique local |
-| IPv4-mapped IPv6 with private IPv4 | Bypass prevention |
-
-**Resolver injected via FastAPI `Depends()`** — never instantiated inside the handler, making DNS resolution mockable without monkey-patching.
-
-**SSRF check runs before ID generation** — a rejected URL consumes no sequence numbers.
+1. Empty/whitespace guard
+2. Scheme allowlist — `http`, `https` only; case-insensitive
+3. Host extraction via `urlparse.hostname`
+4. Hostname denylist — `localhost` blocked by string match
+5. Literal IP fast-path — if host parses as `ipaddress.ip_address`, range-check directly; skip DNS. Handles IPv4-mapped IPv6 and zone-ID stripping
+6. Async DNS — `aiodns.DNSResolver.gethostbyname(host, AF_INET)`; all resolved addresses range-checked; any exception raises `SSRFValidationError`
 
 ---
 
 ### Accepted as-is
 
-| Item | Why accepted |
+| Item | Acceptance rationale |
 |---|---|
-| Fail-closed on DNS error | Safety over availability; unknown = unsafe |
-| Literal IP fast-path (skip DNS for IPs) | Avoids unnecessary DNS calls; prevents DNS rebinding on literal addresses |
-| `aiodns` exclusively (no `getaddrinfo`) | Non-blocking; correct for ASGI |
-| Full IPv6 private range coverage | Zone-ID stripping and IPv4-mapped checks prevent trivial bypass vectors |
+| Fail-closed on DNS error | Safety over availability; unknown resolution = unverifiable |
+| Literal IP fast-path (skip DNS) | Prevents DNS rebinding on literal addresses; eliminates unnecessary DNS calls |
+| `aiodns` exclusively | Non-blocking; correct for ASGI; explicitly mandated in Turn 2 |
+| Full IPv6 private range coverage | Closes trivial bypass vectors |
 | Scheme allowlist (not denylist) | New dangerous schemes emerge; allowlist is future-proof |
-| Resolver dependency injection | Testable without live DNS infrastructure; consistent with project's DI pattern |
-| Validate before consuming a sequence ID | Ensures rejected URLs waste no short-code slots |
-| 40+ contract tests covering every boundary | Exhaustive; each test proves a specific claim about the API contract |
+| Resolver injected via `Depends()` | Testable without live DNS; consistent with DI pattern |
+| Validate before consuming a sequence ID | Rejected URLs waste no short-code slots |
 
 ---
 
 ## Entry 3 — URL Persistence Layer
 
 **Files:** [`app/url_repository.py`](../app/url_repository.py), [`tests/test_url_repository.py`](../tests/test_url_repository.py)  
-**Commit:** `929d2dd` (PR #2)
+**Commit:** `929d2dd` (PR #2)  
+**Branch:** `feature/persistence-logic`
+
+---
+
+### Prompts — Verbatim (2 turns)
+
+**Turn 1 — Test brief:**
+> Now, we are going to work on the persistence layer (Redis Cache and MongoDB)
+>
+> Adhering to strict TDD, write the pytest suite for the URL read-path and write-path. The tests must assert that a cache hit in Redis bypasses MongoDB entirely, and a cache miss queries MongoDB and lazily updates the Redis. Do not write the implementation code yet.
+
+**Turn 2 — Implementation approval:**
+> The persistence tests are approved. Update app.py and create any necessary data modules to make these tests pass. Ensure the PyMongo driver is configured to use strict write concerns (w='majority', j=True) to prevent sequence roadblocks.
+
+*(Note: `j=True` in this prompt was the source of a PyMongo API error — see Bugs below.)*
 
 ---
 
 ### Alternatives AI Evaluated and Discarded
 
-#### Discarded: Write-Through Cache (Populate Redis on Write)
+#### Discarded: Write-through cache (populate Redis on every write)
+Dual-write consistency risk. Also wastes cache RAM on URLs that are never clicked.
 
-The most common cache strategy is write-through: when `save()` is called, write to both MongoDB and Redis simultaneously so the first read is always a cache hit.
-
-**Reasons discarded:**
-
-1. **Dual-write consistency risk.** If the MongoDB write succeeds but the Redis write fails (or vice versa), the two stores diverge. Handling this correctly requires a distributed transaction or a compensating saga — significant complexity for a system designed to be simple and stateless.
-2. **Unnecessary on a cold start.** Many created URLs are never clicked. Writing every URL to Redis on creation wastes cache memory on entries that will never be read from cache.
-3. **Chosen instead:** Read-through (lazy population on cache miss). Redis is populated only when a URL is first looked up. If it's never clicked, it never enters the cache.
-
-#### Discarded: No Redis TTL on Cached Entries
-
-An initial option was to cache entries indefinitely (no TTL), relying on Redis LRU eviction to manage memory.
-
-**Why not documented as rejected:** The implementation does not set a TTL (`redis.set(key, value)` with no `ex=` argument). This was a deliberate choice: short codes are permanent (URLs are never deleted), so a cached entry is always valid. LRU eviction still removes cold entries under memory pressure. AI did not add a TTL because it would introduce spurious cache misses for valid, permanent mappings.
-
-#### Discarded: Null-Cache Poisoning (Cache "Not Found" Results)
-
-A common optimisation is to write a sentinel value to Redis when a lookup returns nothing in MongoDB, preventing repeated database queries for nonexistent short codes.
-
-**Reason discarded:** Introduces a consistency hazard — if a URL is created after a null entry is cached, the cache will serve "not found" until the sentinel expires. The simpler invariant ("Redis is only written when a real URL is found") is safer and correct for a system where short codes are permanent.
+#### Discarded: Null-cache sentinel (caching "not found" results)
+Consistency hazard: if a URL is created after a null sentinel is cached, the cache serves "not found" until the sentinel expires.
 
 ---
 
 ### AI Proposed
 
-`URLRepository` — a single abstraction over Redis and MongoDB implementing the **read-through cache** pattern.
-
-**Write path (`save`):**
-- `insert_one({"_id": short_code, "url": url})` on the Motor `urls` collection
-- Redis is **not** touched; cache population is strictly lazy
-
-**Read path (`get`):**
-1. `redis.get(short_code)` — cache hit → decode bytes → return immediately; MongoDB never queried
-2. Cache miss → `collection.find_one({"_id": short_code})`
-3. Found → `redis.set(short_code, url)` → return URL
-4. Not found → return `None`; Redis **not** written
-
-The exact call sequence `redis.get → mongo.find_one → redis.set` is a first-class contract verified by `TestReadOrder` using a call log rather than mock assertions (which cannot prove ordering).
+`URLRepository` — single abstraction over Redis + MongoDB implementing the read-through cache pattern. Write path: `insert_one` only, Redis untouched. Read path: `redis.get → [mongo.find_one → redis.set]`.
 
 ---
 
 ### Accepted as-is
 
-| Item | Why accepted |
+| Item | Acceptance rationale |
 |---|---|
-| Read-through (not write-through) cache | No dual-write; no null-cache poisoning; natural behaviour for permanent immutable URLs |
-| MongoDB `_id` = short code | Zero-index lookup; no secondary index needed; shard-key routable |
-| No null-cache sentinel | Simpler invariant; permanent short codes make null caching unnecessary |
-| `decode_responses=False` on Redis client | Returns raw bytes; `decode()` called explicitly; avoids silent encoding failures |
-| Call-log test for read ordering | The only reliable way to prove sequencing; mock assertion counts alone cannot prove `get` happened before `find_one` |
-| 18 contract tests across 5 classes | Each class owns one contract (write path, cache hit, cache miss, not found, read order) |
+| Read-through (not write-through) | No dual-write risk; no null-cache poisoning; natural for permanent immutable URLs |
+| MongoDB `_id` = short code | Zero-index lookup; no secondary index; shard-key routable |
+| Call-log test for read ordering | Only reliable proof of sequencing; mock call counts cannot prove `get` happened before `find_one` |
+| No Redis TTL | Short codes are permanent; cached entries always valid |
+
+---
+
+### Bugs AI Introduced
+
+#### Bug — `j=True` instead of `journal=True` in Motor client
+
+The user's Turn 2 prompt specified `w='majority', j=True`. AI implemented this verbatim. Modern PyMongo rejects the short-form `j` parameter with `ConfigurationError: Unknown option: j`, causing FastAPI to crash on startup in a restart loop. Nginx had no healthy upstream and returned `ECONNREFUSED` to the frontend.
+
+**The user diagnosed this bug themselves** (in a later session, PR #8) and submitted the exact fix — see [Entry 7](#entry-7--bug-fixes-pr-8).
+
+```python
+# AI-generated (wrong):
+motor.motor_asyncio.AsyncIOMotorClient(_MONGO_URI, w="majority", j=True)
+
+# Corrected (PR #8):
+motor.motor_asyncio.AsyncIOMotorClient(_MONGO_URI, w="majority", journal=True)
+```
 
 ---
 
 ## Entry 4 — Telemetry Pipeline
 
 **Files:** [`app/telemetry.py`](../app/telemetry.py), [`app/analytics.py`](../app/analytics.py), [`scripts/report.py`](../scripts/report.py), [`tests/test_telemetry.py`](../tests/test_telemetry.py)  
-**Commit:** `9f41e47` (PR #3)
+**Commit:** `9f41e47` (PR #3)  
+**Branch:** `feature/telemetry-logic`
+
+---
+
+### Prompts — Verbatim (2 turns)
+
+**Turn 1 — Test brief:**
+> Let's move on to Telemetry and Analytics Pipeline.
+>
+> Write the test suite for capturing Daily Active User (DAU) and total clicks when a 302 redirection occurs. Do not write the implementation code yet.
+
+**Turn 2 — Implementation approval:**
+> The telemetry tests are approved. Write the asynchronous logging implementation in app/telemetry.py, the offline analytics script in app/analytics.py, and wire the logger into the FastAPI / redirection route in app.py to make these tests pass. Ensure the route schedules the log write as a background task so it does not block the 302 response.
 
 ---
 
 ### Alternatives AI Evaluated and Discarded
 
-#### Discarded: Redis Counters for Click Analytics
+#### Discarded: Redis counters (`INCR` / `PFADD`) for analytics
+Competes with the redirect cache for RAM. Under memory pressure, Redis LRU eviction removes hot redirect-cache entries — exactly the latency the cache exists to prevent.
 
-The most natural approach given Redis is already in the stack: increment a counter per short code (`INCR aB3cD4e`) and a HyperLogLog per day for DAU (`PFADD dau:2026-08-09 <ip>`).
+#### Discarded: Synchronous file write on the hot path
+Blocking `open()` + `write()` stalls the ASGI event loop. At 11,600 redirect QPS this becomes a severe throughput bottleneck.
 
-**Reasons discarded:**
+#### Discarded: Thread-per-write via `threading.Thread`
+Thread creation overhead at 11,600 QPS would exhaust OS thread limits. `asyncio.to_thread()` reuses the shared thread-pool executor.
 
-1. **RAM exhaustion and LRU eviction of hot redirect mappings.** Redis is sized for the redirect cache. Adding analytics counters competes directly with cache memory. Under memory pressure, Redis LRU eviction removes entries — if analytics counters displace hot redirect mappings, cache miss rates rise, MongoDB load increases, and redirect latency degrades. The telemetry pipeline would actively harm the core product feature.
-2. **DAU accuracy with HyperLogLog.** HyperLogLog provides ~2% relative error, which is acceptable for DAU approximations but cannot produce exact counts for auditing or SLA compliance.
-3. **Chosen instead:** Append-only structured JSON log file per worker, consumed offline by a streaming Python script.
-
-#### Discarded: Synchronous File Write on the Hot Path
-
-Writing to the log file synchronously inside the redirect route handler, before returning the 302.
-
-**Reason discarded:** File I/O is blocking. On an ASGI event loop, a synchronous `open()` + `write()` stalls every concurrent coroutine for the duration of the disk write — tens to hundreds of microseconds, potentially milliseconds on a slow storage backend. At 11,600 redirect QPS, this would be a significant throughput bottleneck.
-
-**Chosen instead:** `asyncio.create_task(telemetry.record_redirect(...))` — schedules the log write as a fire-and-forget background task. The route handler returns the 302 immediately; the write happens concurrently.
-
-#### Discarded: Loading the Entire Log File Into Memory for Analytics
-
-Reading `open(log_path).read()` or `json.load()` for analytics processing.
-
-**Reason discarded:** Log files accumulate gigabytes of entries over time (at 100M redirects/day, even 100 bytes per entry = 10 GB/day). Loading the entire file would cause OOM crashes on any machine with less RAM than the total log size.
-
-**Chosen instead:** Generator-based streaming (`stream_entries` is a generator that yields one parsed dict per line). The entire file is never in memory simultaneously.
-
-#### Discarded: Thread-Per-Write Approach
-
-Spawning a new thread for each file write using `threading.Thread`.
-
-**Reason discarded:** Thread creation is expensive; 11,600 redirect QPS × thread-spawn overhead would exhaust the OS thread limit rapidly. `asyncio.to_thread()` reuses the shared thread-pool executor, capping concurrency at the executor's thread limit while keeping the event loop free.
+#### Discarded: Loading entire log file into memory for analytics
+At 100M redirects/day × 100 bytes per entry = 10 GB/day. Bulk `read()` causes OOM on any machine with less RAM than the total log size.
 
 ---
 
 ### AI Proposed
 
-**TelemetryLogger (write path):**
-- `record_redirect(short_code, client_ip)` is `async` — scheduled via `asyncio.create_task()` in the route handler; 302 is returned before the log write starts
-- `asyncio.to_thread(self._append, entry)` offloads the blocking `open()` + `write()` to the thread-pool executor
-- File opened in `"a"` (append) mode — concurrent workers never overwrite each other's entries
-- All exceptions silently swallowed — telemetry loss is preferable to a failed redirect
-- Entry format: `{"ts": "<ISO-8601 UTC>", "code": "...", "ip": "..."}` — UTC timestamp prevents cross-day DAU bleed when logs from multiple time zones are merged
-
-**AnalyticsConsumer (read path — offline):**
-- `stream_entries(log_path)` — generator; reads line-by-line; skips blank lines and malformed JSON silently
-- `entries_for_date(log_path, target_date)` — lazy generator filter over `stream_entries`; UTC date comparison prevents cross-day bleed
-- `compute_dau(entries)` — `set[str]` deduplication; O(U) space bounded by unique IP count, not click volume
-- `compute_total_clicks(entries)` — `collections.Counter`; counts per short code
-
-**`scripts/report.py`** — CLI driver: pipes `entries_for_date → compute_dau` + `compute_total_clicks` into a terminal table. Accepts `--date YYYY-MM-DD` and `TOP_N` env var.
+- **`TelemetryLogger.record_redirect`** — async coroutine; fire-and-forget via `asyncio.create_task()`; file I/O via `asyncio.to_thread()`; all exceptions silently swallowed; append-only JSON lines with UTC timestamps
+- **`AnalyticsConsumer`** — generator-based streaming (`stream_entries`); `set`-based DAU deduplication (O(U) space); `collections.Counter` for click counts; malformed lines silently skipped
+- **Route handler** — schedules `asyncio.create_task(telemetry.record_redirect(...))` and returns the 302 immediately
 
 ---
 
 ### Accepted as-is
 
-| Item | Why accepted |
+| Item | Acceptance rationale |
 |---|---|
-| File-append log over Redis counters | Eliminates RAM competition with the redirect cache; exact counts; no LRU risk |
-| Fire-and-forget via `asyncio.create_task()` | 302 latency is unaffected by telemetry; telemetry failure cannot cause a redirect failure |
-| `asyncio.to_thread()` for file I/O | Non-blocking on the event loop; thread-pool reuse avoids thread-spawn overhead |
-| Swallow all exceptions in TelemetryLogger | Availability > telemetry completeness |
-| UTC timestamps | Cross-server log merging safety; deterministic DAU date boundaries |
+| File-append log over Redis counters | No RAM competition with the redirect cache; exact counts; no LRU risk |
+| Fire-and-forget via `asyncio.create_task()` | 302 latency completely unaffected by telemetry write |
+| `asyncio.to_thread()` for file I/O | Non-blocking on event loop; thread-pool reuse |
+| Swallow all exceptions | Availability > telemetry completeness; documented contract |
+| UTC timestamps in log entries | Cross-server log merging safety; deterministic DAU date boundaries |
 | Generator-based streaming | O(1) memory regardless of log file size |
-| Set-based DAU (`set[str]`) | O(U) space; correct deduplication semantics; exact count (not approximate) |
-| Silent skip of malformed lines | A single corrupted write from disk full or race condition cannot halt an analytics run |
-| 28 contract tests | Covers format, timestamp contract, async/error isolation, streaming, DAU, clicks, date filtering |
+| `set`-based DAU | O(U) space; exact deduplication |
 
 ---
 
 ## Entry 5 — Docker Orchestration
 
 **Files:** [`docker-compose.yaml`](../docker-compose.yaml), [`Dockerfile`](../Dockerfile), [`nginx/nginx.conf`](../nginx/nginx.conf)  
-**Initial commits:** `a17e1a6` + `125f4a7` (PR #4)  
-**Patches:** `147c0a1` (PR #8)
+**Commits:** `a17e1a6` + `125f4a7` (PR #4); bug patch `147c0a1` (PR #8)  
+**Branch:** `feature/system-orchestration`
+
+---
+
+### Prompt — Verbatim
+
+> We are now going to move on to System Orchestration
+>
+> Generate the docker-compose.yaml. Enforce strict network isolation: only the Nginx Layer 7 API Gateway should expose port 80 to the host. FASTAPI, Redis and MongoDB must communicate strictly on a private internal network. Mount a shared volume for the local telemetry logs so the parser script can access them.
 
 ---
 
 ### Alternatives AI Evaluated and Discarded
 
-#### Discarded: `internal: true` Network Bridge
+#### Discarded: `internal: true` Docker network bridge
+Blocks outbound connectivity from all containers. FastAPI workers need outbound DNS for `aiodns.DNSResolver.gethostbyname()` at request time. An `internal: true` network silently breaks SSRF validation for all hostname URLs.
 
-Docker Compose supports an `internal: true` flag on a bridge network that blocks all outbound connectivity from containers on that network.
+#### Discarded: Standalone MongoDB
+Does not support `w="majority"` write concern. Motor would silently downgrade to `w=1`, removing the durability guarantee.
 
-**Reason discarded:** FastAPI workers need outbound DNS connectivity to call `aiodns.DNSResolver.gethostbyname()` during SSRF validation at request time. An `internal: true` network would block these DNS queries, breaking the SSRF shield entirely for hostname URLs. AI explicitly documented this in the Compose file comment:
+#### Discarded: Inline `rs.initiate()` in the mongo service `command:`
+Race condition: `mongod` is not ready to accept commands when its own command line starts. Using a separate `mongo-init` container that depends on `mongo: condition: service_healthy` guarantees correct timing.
 
-> *"The bridge flag is NOT set to `internal: true` so that FastAPI workers can make outbound aiodns calls for SSRF validation. Isolation is enforced solely by the absence of host port mappings on internal services."*
+#### Discarded: Always-on analytics container
+Idle resource waste. Opt-in via `profiles: [analytics]` keeps the main stack clean.
 
-**Chosen instead:** Standard bridge with no `internal` flag. Network isolation is enforced by the absence of `ports:` declarations on internal services, not by OS-level network blocking.
+#### Discarded: HTTP 301 (Permanent Redirect)
+Browser caches the redirect. Every repeat click goes directly to the destination — TelemetryLogger sees only the first click per browser per short code. The user later asked AI to document this decision explicitly in README (see Entry 6 below).
 
-#### Discarded: Standalone MongoDB (No Replica Set)
-
-Running MongoDB as a standalone `mongod` instance is simpler and faster to start.
-
-**Reason discarded:** Standalone MongoDB does not support `w="majority"` write concern. The Motor client is configured with `w="majority"` + `journal=True` to ensure every URL document is durably acknowledged by a majority of replica nodes before the 201 is returned — preventing data loss on primary failover. A standalone instance would silently downgrade this to `w=1`, removing the durability guarantee.
-
-**Chosen instead:** Single-node replica set `rs0` (`mongod --replSet rs0`). A single-node replica set is operationally equivalent to standalone but supports majority write concerns. The `mongo-init` one-shot container calls `rs.initiate()` wrapped in a `try/catch` for idempotency.
-
-#### Discarded: Inlining MongoDB Init into the `mongo` Service Command
-
-Running `rs.initiate()` directly in the `mongo` service's `command:` field.
-
-**Reason discarded:** `rs.initiate()` requires the mongod process to be fully started and listening before it runs. Running it in the same command as `mongod` creates a race condition. The `mongo-init` sidecar pattern — a separate container that depends on `mongo: condition: service_healthy` — guarantees the replica set is only initialised after the healthcheck confirms mongod is ready.
-
-#### Discarded: Always-On Analytics Container
-
-Running the analytics consumer as a persistent background service alongside the main stack.
-
-**Reason discarded:** The analytics consumer reads from a log file — it has nothing to do when no new entries exist, and running it continuously wastes container resources. More importantly, a long-running analytics container would need to handle log rotation and file truncation, significantly complicating the implementation.
-
-**Chosen instead:** Opt-in via `profiles: [analytics]`. The container is never started with the main stack and is invoked on-demand via `docker compose --profile analytics run --rm analytics`. It runs to completion and exits.
-
-#### Discarded: HTTP 301 (Permanent) Redirect
-
-HTTP 301 is the conventional redirect status code for URL shorteners and is cached aggressively by browsers.
-
-**Reason discarded:** Browser caching breaks the telemetry pipeline. On a 301, the browser caches the destination URL and on subsequent clicks goes directly to the destination without ever contacting the URL shortener. The telemetry logger (which records redirects server-side) would see only the first click from any given browser for a given short code — all subsequent clicks are invisible. DAU and total-click counts would be severely undercounted.
-
-**Chosen instead:** HTTP 302 (Found, temporary redirect). Browsers do not cache 302 responses; every click reaches the server and is recorded by `TelemetryLogger`.
-
-| | HTTP 301 | HTTP 302 |
-|---|---|---|
-| Browser caching | Yes — first click only | No — every click reaches server |
-| Telemetry accuracy | Severely undercounted | Accurate |
-| SEO | Full link equity transferred | Reduced link equity |
-| Redirect latency (repeat clicks) | Zero (browser cache) | Network round-trip |
-
-For a system whose core value proposition is analytics, telemetry accuracy takes precedence over SEO and repeat-click latency.
-
-#### Discarded: Publishing FastAPI Port on the Host
-
-Mapping `fastapi:8000` to the host (e.g., `ports: ["8000:8000"]`) for easier local development.
-
-**Reason discarded:** Direct FastAPI access bypasses Nginx's rate limiter and the `X-Real-IP` header injection. Telemetry would record Nginx's container IP instead of the originating client IP. Publishing the port also means production deployments (where this Compose file is authoritative) would accidentally expose the ASGI app directly to the internet.
-
-**Chosen instead:** No `ports:` on `fastapi`. All traffic enters through Nginx. A Vite dev proxy (`/shorten → http://localhost:80`) routes frontend development traffic through the same Nginx entry point.
-
----
-
-### AI Proposed
-
-Six-service Compose stack with strict network isolation:
-
-| Service | Image | Ports | Notes |
-|---|---|---|---|
-| `nginx` | `nginx:1.27-alpine` | `80:80` | Sole public ingress |
-| `fastapi` | Custom (`python:3.13-slim`) | None | 4 Uvicorn workers; healthcheck: `curl -f /health` |
-| `redis` | `redis:7-alpine` | None | healthcheck: `redis-cli ping` |
-| `mongo` | `mongo:7` | None | `--replSet rs0`; healthcheck: `mongosh ping` |
-| `mongo-init` | `mongo:7` | None | One-shot; idempotent `rs.initiate()`; `restart: "no"` |
-| `analytics` | Same as fastapi | None | `profiles: [analytics]`; log volume read-only; `restart: "no"` |
-
-Startup order enforced by `depends_on` + `condition`:  
-`mongo (healthy) → mongo-init (completed_successfully) → fastapi (healthy) ←→ redis (healthy) → nginx`
-
-Nginx rate limiting: 200 req/s per IP, burst queue 500, `nodelay` (reject rather than queue excess).  
-Upstream keepalive: 64 persistent connections to fastapi workers for connection reuse at high QPS.  
-Proxy headers: `X-Real-IP $remote_addr` — so TelemetryLogger records the originating client IP, not Nginx's container IP.
+#### Discarded: Publishing FastAPI port on the host
+Bypasses Nginx rate limiter. Client IP recorded in telemetry would be Nginx's container IP, not the originating address.
 
 ---
 
 ### Accepted as-is
 
-| Item | Why accepted |
+| Item | Acceptance rationale |
 |---|---|
-| No `internal: true` network flag | Required for outbound aiodns DNS calls in SSRF validation |
-| Single-node replica set (`rs0`) | Only way to support `w="majority"` write concern without operational complexity |
-| `mongo-init` sidecar pattern | Race-condition-free initialisation; idempotent on stack restarts |
-| HTTP 302 for redirects | Ensures every click reaches the telemetry logger; 301 would cache on the browser |
-| Analytics as opt-in profile | No idle container overhead; no log-rotation handling needed |
-| `X-Real-IP` header passthrough | Telemetry records the client IP, not Nginx's container IP |
+| Standard bridge (no `internal: true`) | Required for aiodns outbound DNS calls |
+| Single-node replica set `rs0` | Only configuration supporting `w="majority"` without multi-host complexity |
+| `mongo-init` sidecar pattern | Race-condition-free; idempotent on restarts |
+| HTTP 302 redirects | Every click reaches the server; telemetry pipeline is fully observable |
+| Analytics as opt-in `profiles: [analytics]` | No idle overhead; no log-rotation complexity |
+| `X-Real-IP $remote_addr` in Nginx | Telemetry records originating client IP, not Nginx container IP |
 | `server_tokens off` in Nginx | Suppresses version disclosure in error responses |
-| `curl` installed in `python:3.13-slim` Dockerfile | Required only for the Compose healthcheck probe; explicit in comments |
 
 ---
 
-### Bugs AI Introduced
+## Entry 6 — Design Decisions & README Consolidation
 
-#### Bug 1: `j=True` instead of `journal=True` in Motor Client
+**Files:** `README.md`, `CLAUDE.md` (deleted), `architect.md` (deleted)  
+**Commits:** `304a6b3` (alternatives section — reverted by user), `42fee0d` (consolidation)  
+**Branch:** `feature/design-decisions`
 
-**Introduced in:** `573dd0e` (initial commit)  
-**Fixed in:** `147c0a1` (PR #8)  
-**Symptom:** FastAPI crashed on startup with `ConfigurationError` from PyMongo when running inside Docker Compose, putting the service into a restart loop. Nginx had no healthy upstream and returned ECONNREFUSED to the frontend.
+---
+
+### Prompts — Verbatim (key turns)
+
+**Evaluated alternatives section (committed by AI without approval — later reverted by user):**
+> Create a new subsection under the Distributed ID Generation heading titled "Evaluated Alternatives & Trade-offs". Explicitly detail why we rejected the following common approaches:
+>
+> 1. Relational DB Auto-Increment & Multi-Master Replication: Standard sequential IDs create a severe enumeration vulnerability. Furthermore, using multi-master replication with step increments (e.g., Server A generates odd numbers, Server B generates even) is highly rigid. It fails to scale dynamically when database nodes are added or removed and does not maintain chronological ordering.
+> 2. Hashing (e.g., MD5 / SHA-256): Hashing the original URL and truncating it to 7 characters introduces a high risk of collisions. Handling these collisions requires expensive "read-before-write" database checks, which destroys our ultra-low latency write path.
+> 3. Universally Unique Identifiers (UUIDs): Standard UUIDs are 36 characters long, which completely defeats the primary product requirement of building a URL shortener.
+
+**HTTP 301 vs 302 architectural decision:**
+> Please update the `README.md` to document our decision regarding the HTTP redirection status code. Add a new subsection titled "Architectural Decision: HTTP 301 vs. HTTP 302 Redirects". Format this section to clearly compare the browser caching behaviors and explain why we explicitly chose the 302 Temporary Redirect for this system:
+>
+> * HTTP 301 (Permanent Redirect): The browser caches the redirect permanently. Subsequent requests from the same user do not hit our shortener server. While this is highly optimized to reduce server loads and minimize backend costs, it blinds our backend to repeat traffic.
+> * HTTP 302 (Temporary Redirect) — Our Choice: The browser does not cache the redirect. Every single click hits our server for resolution.
+>
+> Conclude the section by explicitly stating that we selected the HTTP 302 Temporary Redirect because our system requirements mandate precise, real-time tracking of click metrics, source analytics, and user telemetry. Sacrificing the caching benefits of a 301 is a deliberate and necessary trade-off to ensure our telemetry pipeline captures every single redirection event.
+
+**MongoDB vs SQL architectural decision:**
+> Please update the `README.md` to document our database technology choice, specifically grounding the decision in our capacity planning. Add a new subsection titled "Architectural Decision: NoSQL (MongoDB) vs. Relational (SQL)".
+>
+> 1. Massive Scale and Horizontal Scalability: Based on our back-of-the-envelope estimates for a 10-year period, our platform must support 365 billion records, demanding roughly 36.5 TB of persistent storage. NoSQL databases are natively engineered for horizontal scaling, allowing us to seamlessly distribute this massive metadata volume across a sharded cluster. Conversely, scaling relational databases horizontally is notoriously complex, making cross-shard joins and dynamic resharding extremely difficult at this scale.
+> 2. Predictable Low-Latency and Simple Data Patterns: Our back-of-the-envelope estimates dictate that the system must support an average of 11,600 redirect read requests per second. Our data model does not require complex relational tables or ACID-compliant joins; it relies on simple, structured key-value mappings.
+
+**Documentation consolidation (final state):**
+> We need to finalize our project documentation. Please refactor and rewrite the `README.md` to serve as the single source of truth for this URL Shortener architecture.
+>
+> Action Items:
+> 1. Consolidate and Clean Up: Review the current `README.md`, `claude.md`, and `architect.md` files. Merge all architectural constraints, scale parameters, and design decisions into the `README.md`. Once merged, delete `claude.md` and `architect.md` as they are now redundant.
+> 2. Logical Ordering: Restructure the `README.md` using the following exact hierarchy:
+>    * Project Overview & Tech Stack
+>    * Capacity Planning & Scale (100M writes/day, 1B reads/day, 11,600 read QPS, 36.5 TB storage over 10 years)
+>    * Architectural Decisions & Trade-offs (NoSQL vs SQL; Distributed ID Generation with Evaluated Alternatives; HTTP 301 vs 302; SSRF Shield; Telemetry Pipeline)
+>    * Local Setup & Test-Driven Development (TDD)
+> 3. Formatting: Ensure the document uses clean Markdown formatting, tables where appropriate, and clear code blocks. Remove any duplicated paragraphs or overlapping bullet points.
+
+---
+
+### Rejected — AI Committed Without Approval
+
+**Commit added:** `304a6b3`  
+**User response:** "I didn't want you to commit and push the changes yet. Revert the commit and push."
+
+AI committed and pushed the alternatives section before the user had approved it for that location. The user manually reversed this. The content was later approved and included through the structured consolidation prompt above.
+
+---
+
+### Modified Before Acceptance — Docs Consolidation
+
+`CLAUDE.md` and `architect.md` were deleted and their content merged into `README.md`. This was entirely user-directed: the user identified the three-document overlap as a maintenance burden and specified the exact section hierarchy and content to include.
+
+---
+
+## Entry 7 — Bug Fixes (PR #8)
+
+**Commit:** `147c0a1`  
+**Branch:** `feature/design-decisions`
+
+---
+
+### Prompt — Verbatim
+
+> We have a URL Shortener repo with Docker Compose: Nginx is the only host-published port (`80:80`). FastAPI, Redis, and MongoDB stay on an internal network (no host ports). Local frontend is Vite + React; Vite proxies `POST /shorten` to the API.
+>
+> 1. FastAPI crash on startup: In `app/app.py`, `AsyncIOMotorClient` is created with `w="majority", j=True`. Modern PyMongo rejects `j` (`ConfigurationError: Unknown option: j`). Use `journal=True` instead. Until this is fixed, the FastAPI container restart-loops, Nginx never becomes healthy, and the frontend gets `ECONNREFUSED` on `/shorten`.
+> 2. Vite proxy target wrong for Compose: `frontend/vite.config.js` was proxying `/shorten` → `http://localhost:8000`. FastAPI is not published on the host; only Nginx is on `:80`. Proxy should target `http://localhost:80`.
+>
+> Architecture notes (do not "fix" these unless product asks):
+> * Short URLs are prefixed with `BASE_URL` (Compose sets `BASE_URL=http://localhost`). That's intentional for local Nginx.
+> * Same long URL can get different short codes: each `POST /shorten` always mints a new ID (Feistel + segment lease) and `insert_one`s. No reverse lookup by destination URL. Deduping would add write-path cost/indexing/races; leaving it out is correct for this high-throughput design unless the product requires one code per URL.
+>
+> Review my findings, if they are appropriate, make the necessary changes and commit.
+
+---
+
+### Note on Bug Attribution
+
+**Both bugs were diagnosed by the user, not discovered by AI.** The user identified the root causes, specified the correct fixes, and included architectural context explaining what should *not* be changed. AI's role in this entry was implementing the user-specified fixes.
+
+#### Bug 1 — `j=True` → `journal=True`
+
+**Root cause:** AI generated code valid for an older PyMongo API. The `j` short-form was removed in PyMongo 3.x.
+
+**Impact:** FastAPI crash loop on startup → Nginx has no healthy upstream → frontend gets `ECONNREFUSED` on every `POST /shorten`.
 
 ```python
 # AI-generated (wrong):
@@ -469,13 +474,9 @@ motor.motor_asyncio.AsyncIOMotorClient(_MONGO_URI, w="majority", j=True)
 motor.motor_asyncio.AsyncIOMotorClient(_MONGO_URI, w="majority", journal=True)
 ```
 
-Modern PyMongo (3.x+) rejects the short-form `j` option. The short-form was valid in older PyMongo versions; the API changed and AI generated stale code.
+#### Bug 2 — Vite proxy → `localhost:8000` instead of `localhost:80`
 
-#### Bug 2: Vite Dev Proxy Pointed at FastAPI Directly
-
-**Introduced in:** `e63cd71` (frontend commit)  
-**Fixed in:** `147c0a1` (PR #8)  
-**Symptom:** Running `npm run dev` with Docker Compose produced ECONNREFUSED errors on `POST /shorten` because `localhost:8000` is not published to the host.
+**Root cause:** AI defaulted to the FastAPI ASGI port (8000) without accounting for the Docker network isolation constraint that removes FastAPI's host-mapped port entirely.
 
 ```js
 // AI-generated (wrong):
@@ -485,105 +486,91 @@ proxy: { '/shorten': { target: 'http://localhost:8000', changeOrigin: true } }
 proxy: { '/shorten': { target: 'http://localhost:80', changeOrigin: true } }
 ```
 
-FastAPI is not published on any host port. The only entry point is Nginx on port 80. The Vite proxy must route through Nginx to match the production path.
+---
+
+## Entry 8 — AI Traceability Document & Quality Gates
+
+**Files:** [`docs/ai_execution_log.md`](ai_execution_log.md), [`docs/quality_gates.md`](quality_gates.md), [`ruff.toml`](../ruff.toml)  
+**Branches:** `feature/AI-traceability`, `feature/quality_gates`  
+**Session:** `a6e7b415`
 
 ---
 
-## Entry 6 — Documentation Architecture
+### Prompts — Verbatim
 
-**Files:** `README.md`, `CLAUDE.md` (deleted), `architect.md` (deleted)  
-**Commits:** `573dd0e` (initial spec files), `42fee0d` (consolidation + deletion), `304a6b3` + `cda7695` (alternatives section — added then reverted)
+**Initial traceability request:**
+> AI Traceability Document (docs/ai_execution_log.md)
+>
+> For each major task — Feistel cipher, SSRF validator, telemetry pipeline, Docker orchestration — you need a logged entry in this format.
+>
+> I have already completed the project with AI assistance. Can you go ahead create a AI Traceability Document by reviewing our work from scratch?
+
+**Expansion request:**
+> I also want to include what I rejected, suggested and accepted as part of the AI traceability. Don't limit within provided constraint, you can more extensive.
+
+**Quality gates:**
+> Run: pip install ruff / ruff check app/ tests/ / pip install bandit / bandit -r app/ -f txt / pip install pytest-cov / pytest tests/ --cov=app --cov-report=term-missing
+>
+> and create docs/quality_gates.md
+
+**Add linter to project:**
+> Add linter in our project to clean up the code.
+
+**Branch reorganisation:**
+> Do not commit the changes to linter and quality_gates as part of the traceability. Create a new feature/quality_gates, commit changes there and push. Hard reset from the feature/AI-traceability.
+>
+> Also, push the report as quality_gates.md after the quality gates are run.
+
+**Prompt log revision — add verbatim prompts from session transcripts:**
+> The traceability log is missing the actual prompts. Go through the session transcripts at ~/.claude/projects/-Users-roshanlamichhane-Documents-URL-Shortener/ and rewrite the log to include verbatim prompt text for each entry.
 
 ---
 
-### AI Proposed
+### Quality Gate Results (from `docs/quality_gates.md`)
 
-Initial commit `573dd0e` created two separate spec files:
-- `CLAUDE.md` — project instructions and architectural constraints
-- `architect.md` — a 40-line architecture specification used as the source of truth for section numbering (§1 through §6) referenced in all implementation docstrings
+| Gate | Tool | Result |
+|---|---|---|
+| Linting | `ruff check app/ tests/` | **PASS** — 0 issues after auto-fix |
+| Security scan | `bandit -r app/` | **1 Low** — intentional B110 in `telemetry.py` (swallowed exception; by design) |
+| Test coverage | `pytest --cov=app --cov-report=term-missing` | **146/146 PASS** — 70% overall coverage |
 
-### Accepted Initially, Then Revised
-
-The two-file approach was used through PRs #1–4. In commit `42fee0d`, both files were deleted and their content merged into `README.md` as the single source of truth. The section numbering (§3 through §6) was retained in docstrings but now refers to README sections rather than a separate spec file.
-
-**Reason for consolidation:** Three separate documents (`CLAUDE.md`, `architect.md`, `README.md`) with overlapping content created a maintenance burden. Any architectural change would require updating three files. The README is the document most likely to be read by new contributors; concentrating all architecture documentation there reduces the risk of spec/implementation drift.
-
-### Rejected — Alternatives Section in README
-
-AI added a "Evaluated Alternatives & Trade-offs" section to `README.md` (commit `304a6b3`) documenting the three discarded ID generation approaches. This was reverted 102 seconds later (commit `cda7695`).
-
-**Reason for rejection:** The README is the operational handbook for anyone deploying or contributing to the system. Rejected-approach analysis is process documentation that belongs in an AI traceability log (this file), not in the operational README. Keeping process and operation documentation separate prevents the README from becoming a design-archaeology document.
+The 24 ruff issues auto-fixed included: `UP035` (deprecated `typing` imports → `collections.abc`), `UP017` (`datetime.timezone.utc` → `datetime.UTC`), `F401` (unused imports in test files), `I001` (import ordering), `FURB122` (`for`-loop write → `writelines`), `RET501` (useless `return None`).
 
 ---
 
 ## Cross-Cutting Summary
 
+### Actual Prompt Patterns Observed
+
+| Pattern | Frequency | Examples |
+|---|---|---|
+| TDD-first (tests before implementation) | 4 tasks | ID Gen, SSRF, Persistence, Telemetry |
+| Multi-turn correction loop (initial rejected, rewritten) | 1 task | ID Gen (Snowflake → Feistel, 3 turns before approval) |
+| User diagnosed bug, AI implemented fix | 2 bugs | `j=True`, Vite proxy |
+| User specified exact value, AI documented rationale | 1 | Lease size 1M → 10K |
+| User directed architectural decision, AI documented | 3 | HTTP 302, MongoDB vs SQL, Evaluated Alternatives |
+| AI committed without approval → user reverted | 1 | README alternatives section (`304a6b3`) |
+
 ### Proposals Accepted Without Modification
 
-| Category | Proposal | Entry |
-|---|---|---|
-| ID Generation | 4-round, 42-bit Feistel cipher | 1 |
-| ID Generation | Cycle-walking for domain mismatch | 1 |
-| ID Generation | `asyncio.Lock` for lease serialisation | 1 |
-| ID Generation | Round keys from environment variables | 1 |
-| ID Generation | TDD contract-first test methodology | 1 |
-| SSRF | Fail-closed on DNS error | 2 |
-| SSRF | `aiodns` exclusively (no `getaddrinfo`) | 2 |
-| SSRF | Literal IP fast-path (skip DNS) | 2 |
-| SSRF | Scheme allowlist (not denylist) | 2 |
-| SSRF | Resolver via dependency injection | 2 |
-| SSRF | Validate before consuming sequence IDs | 2 |
-| Persistence | Read-through cache (not write-through) | 3 |
-| Persistence | No null-cache poisoning | 3 |
-| Persistence | Call-log test for read ordering | 3 |
-| Telemetry | File-append log (not Redis counters) | 4 |
-| Telemetry | Fire-and-forget via `asyncio.create_task()` | 4 |
-| Telemetry | `asyncio.to_thread()` for file I/O | 4 |
-| Telemetry | Swallow all exceptions in TelemetryLogger | 4 |
-| Telemetry | Generator-based streaming analytics | 4 |
-| Telemetry | Set-based DAU computation | 4 |
-| Docker | No `internal: true` network flag | 5 |
-| Docker | Single-node replica set for `w="majority"` | 5 |
-| Docker | `mongo-init` sidecar pattern | 5 |
-| Docker | HTTP 302 (not 301) redirects | 5 |
-| Docker | Analytics as opt-in Compose profile | 5 |
-| Docker | `X-Real-IP` header passthrough via Nginx | 5 |
+Feistel cipher construction; cycle-walking; `asyncio.Lock`; round keys from env vars; IDGenerator per-request stateless shim; fail-closed SSRF; aiodns exclusively; literal IP fast-path; scheme allowlist; resolver via `Depends()`; read-through cache; no null-cache poisoning; call-log test for ordering; no Redis TTL; fire-and-forget telemetry; `asyncio.to_thread()`; swallow all telemetry exceptions; UTC timestamps; generator streaming; set-based DAU; standard Docker bridge; single-node replica set `rs0`; `mongo-init` sidecar; HTTP 302; analytics opt-in profile; `X-Real-IP` passthrough; `server_tokens off`.
 
 ### Proposals Modified Before Acceptance
 
-| Proposal | What Changed | Why | Entry |
-|---|---|---|---|
-| `DEFAULT_LEASE_SIZE = 1_000_000` | Reduced to 10,000 | 99% reduction in crash-leakage; DB load remains trivial | 1 |
-| Vite proxy → `localhost:8000` | Changed to `localhost:80` | FastAPI is not published; Nginx is the entry point | 5 |
-| `MONGO_URI` default without replica set param | Added `?replicaSet=rs0` | Motor requires the param to honour `w="majority"` in Compose | 5 |
-| Two separate spec files (`CLAUDE.md`, `architect.md`) | Deleted and merged into README | Single source of truth; eliminates spec/implementation drift | 6 |
-
-### Proposals Rejected
-
-| Proposal | Reason | Commit |
+| Proposal | Change | Who initiated |
 |---|---|---|
-| "Evaluated Alternatives" section in README | Process docs belong in traceability log, not operational README | `cda7695` (revert of `304a6b3`) |
-| `j=True` on Motor client | Wrong parameter name; crashes FastAPI startup | Fixed in `147c0a1` |
+| `DEFAULT_LEASE_SIZE = 1,000,000` | Reduced to 10,000 (99% crash-leakage reduction) | User (Turn 4 prompt) |
+| Vite proxy `localhost:8000` | Changed to `localhost:80` | User (PR #8 prompt — diagnosed themselves) |
+| `j=True` on Motor client | Changed to `journal=True` | User (PR #8 prompt — diagnosed themselves) |
+| Separate `CLAUDE.md` + `architect.md` | Deleted; merged into README | User (consolidation prompt) |
 
-### Alternatives AI Evaluated and Discarded (Never Implemented)
+### AI-Generated Code That Required User Correction
 
-| Alternative | Reason Discarded | Entry |
+| Issue | Discovered by | How |
 |---|---|---|
-| Relational DB auto-increment | Enumerable short codes; multi-master rigidity | 1 |
-| MD5/SHA-256 hash truncation | Birthday collision at ~1.5M URLs; read-before-write penalty | 1 |
-| UUID v4 | 36 characters; defeats URL shortener requirement | 1 |
-| `socket.getaddrinfo` for DNS | Blocks the ASGI event loop | 2 |
-| Fail-open on DNS error | Unknown resolution = unverifiable safety | 2 |
-| Domain allowlist for SSRF | Limits utility; requires constant maintenance; doesn't prevent rebinding | 2 |
-| Server-side prefetch on redirect | Secondary SSRF surface on read path; latency dependency | 2 |
-| Write-through cache | Dual-write consistency risk; wastes RAM on unread URLs | 3 |
-| Redis counters for telemetry | LRU eviction displaces hot redirect-cache entries | 4 |
-| Synchronous file write on hot path | Blocks event loop; degrades redirect throughput | 4 |
-| Thread-per-write for file I/O | Thread-spawn overhead at 11,600 QPS; exhausts OS thread limit | 4 |
-| Load entire log file for analytics | OOM on multi-gigabyte log files | 4 |
-| `internal: true` Docker network | Blocks outbound aiodns DNS calls; breaks SSRF validation | 5 |
-| Standalone MongoDB | No `w="majority"` support | 5 |
-| Inline `rs.initiate()` in mongo command | Race condition; mongod not ready when init runs | 5 |
-| Always-on analytics container | Idle resource waste; log-rotation complexity | 5 |
-| HTTP 301 redirect | Browser-cached; telemetry sees only first click per browser | 5 |
-| Publishing FastAPI port on host | Bypasses Nginx rate limiter and `X-Real-IP` injection | 5 |
+| Snowflake ID generator (wrong architecture) | User | Attached architect.md; wrote Turn 2 correction prompt |
+| `socket.getaddrinfo` in SSRF tests | User | Named it explicitly in Turn 2 prompt |
+| Missing Base-62 integration tests | User | Noticed gap; specified addition in Turn 3 |
+| `j=True` → `ConfigurationError` at startup | User | Ran the stack; diagnosed root cause; wrote PR #8 prompt |
+| Vite proxy → `ECONNREFUSED` on `/shorten` | User | Ran the stack; diagnosed root cause; wrote PR #8 prompt |
+| AI committed without approval | User | Manually ran `git revert` and specified reversal |
