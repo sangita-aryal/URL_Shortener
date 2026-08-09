@@ -106,54 +106,6 @@ primary failover.
 
 Relevant source: [`app/id_generator.py`](app/id_generator.py) — `SequenceLeaseManager`
 
-#### Evaluated Alternatives & Trade-offs
-
-Three common approaches were considered and rejected before arriving at the
-Feistel + segment-leasing design.
-
-**1. Relational DB Auto-Increment & Multi-Master Replication**
-
-The most widely taught approach is a single auto-incrementing primary key in a
-relational database. It has two fatal flaws for this system:
-
-- **Enumeration vulnerability.** Sequential IDs are trivially guessable.
-  An attacker (or a scraper) can iterate through every shortened URL ever
-  created by simply incrementing the short code. There is no cryptographic
-  barrier between knowing one valid short code and knowing all of them.
-
-- **Multi-master rigidity.** A common workaround is to assign each database
-  node a different starting offset and step (Server A: 1, 3, 5 …; Server B:
-  2, 4, 6 …). This eliminates the single-writer bottleneck but is operationally
-  brittle: the step size must be fixed at cluster inception. Adding or removing
-  a node mid-operation breaks the scheme, requires a coordinated migration, and
-  does not preserve chronological ordering of IDs across nodes.
-
-**2. Hashing (MD5 / SHA-256)**
-
-Hashing the destination URL and truncating the digest to 7 characters is
-superficially appealing — it is stateless and requires no coordination — but
-it introduces an unavoidable collision problem.
-
-A 7-character truncation of a hash retains only 41 bits of the original
-digest. By the birthday paradox, the probability of a collision reaches 50%
-after approximately 1.5 million URLs. Handling each collision requires a
-**read-before-write** round-trip to the database to check whether the hash is
-already occupied, and a second hash (with a salt or counter) if it is. This
-doubles write-path latency in the common case and adds an unbounded retry loop
-in the worst case — directly contradicting the ultra-low latency write
-requirement.
-
-**3. Universally Unique Identifiers (UUIDs)**
-
-UUID v4 is a proven collision-resistant identifier, but a standard UUID is
-**36 characters long** (e.g., `550e8400-e29b-41d4-a716-446655440000`). Using
-one as a short code would produce URLs longer than most of the original
-destinations, defeating the entire product requirement. Truncating a UUID to 7
-characters strips the collision-resistance properties and reintroduces the
-birthday-paradox collision risk described above.
-
----
-
 #### Architectural Trade-off: Lease Size
 
 The `DEFAULT_LEASE_SIZE` is set to **10,000** (not 1,000,000).
