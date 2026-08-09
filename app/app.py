@@ -13,14 +13,16 @@ Design mandates enforced here:
 import asyncio
 import os
 from contextlib import asynccontextmanager
+from datetime import UTC, date, datetime
 from typing import Annotated
 
 import aiodns
 import motor.motor_asyncio
 import redis.asyncio as aioredis
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 
+from app.analytics import AnalyticsConsumer
 from app.id_generator import FeistelCipher, IDGenerator, SequenceLeaseManager
 from app.ssrf_validator import SSRFValidationError, validate_url
 from app.telemetry import TelemetryLogger
@@ -69,6 +71,7 @@ async def lifespan(app: FastAPI):
         redis_client=redis_client,
     )
     app.state.telemetry = TelemetryLogger(log_path=_LOG_PATH)
+    app.state.analytics = AnalyticsConsumer()
 
     yield
 
@@ -111,12 +114,17 @@ def get_telemetry(request: Request) -> TelemetryLogger:
     return request.app.state.telemetry
 
 
+def get_analytics_consumer(request: Request) -> AnalyticsConsumer:
+    return request.app.state.analytics
+
+
 # ── Convenience type aliases for route signatures ─────────────────────────────
 
 ResolverDep   = Annotated[aiodns.DNSResolver, Depends(get_resolver)]
 IDGenDep      = Annotated[IDGenerator,         Depends(get_id_generator)]
 RepoDep       = Annotated[URLRepository,       Depends(get_url_repo)]
 TelemetryDep  = Annotated[TelemetryLogger,     Depends(get_telemetry)]
+AnalyticsDep  = Annotated[AnalyticsConsumer,   Depends(get_analytics_consumer)]
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -128,6 +136,23 @@ class ShortenRequest(BaseModel):
 class ShortenResponse(BaseModel):
     short_code: str
     short_url: str
+
+
+class StatsResponse(BaseModel):
+    code: str
+    total_clicks: int
+
+
+class TopCode(BaseModel):
+    code: str
+    clicks: int
+
+
+class AnalyticsSummaryResponse(BaseModel):
+    date: str
+    dau: int
+    total_clicks: int
+    top_codes: list[TopCode]
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -164,6 +189,34 @@ async def shorten_url(
         short_code=short_code,
         short_url=f"{_BASE_URL}/{short_code}",
     )
+
+
+@app.get("/stats/{code}", response_model=StatsResponse)
+async def code_stats(
+    code: str,
+    analytics: AnalyticsDep,
+) -> StatsResponse:
+    """All-time click count for a single short code."""
+    return StatsResponse(code=code, total_clicks=analytics.click_count_for_code(_LOG_PATH, code))
+
+
+@app.get("/analytics", response_model=AnalyticsSummaryResponse)
+async def analytics_summary(
+    analytics: AnalyticsDep,
+    target_date: date | None = Query(default=None, alias="date"),
+) -> AnalyticsSummaryResponse:
+    """
+    Batch analytics for a calendar day.
+
+    Ambiguous requirement interpreted as:
+      - Batch (reads log file); no new streaming infra needed.
+      - Defaults to today UTC when date param is omitted.
+      - Metrics: DAU (unique IPs), total clicks, top-5 codes by clicks.
+      - No auth: internal network only, consistent with the rest of the API.
+    """
+    resolved = target_date or datetime.now(UTC).date()
+    summary = analytics.summary_for_date(_LOG_PATH, resolved)
+    return AnalyticsSummaryResponse(**summary)
 
 
 @app.get("/{short_code}")

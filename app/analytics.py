@@ -28,7 +28,11 @@ class AnalyticsConsumer:
 
     def stream_entries(self, log_path: str) -> Iterator[dict]:
         """Yield parsed log entries one at a time; skip blank and malformed lines."""
-        with open(log_path) as f:
+        try:
+            f = open(log_path)  # noqa: SIM115
+        except FileNotFoundError:
+            return
+        with f:
             for raw in f:
                 raw = raw.strip()
                 if not raw:
@@ -65,3 +69,24 @@ class AnalyticsConsumer:
             if code:
                 counts[code] += 1
         return dict(counts)
+
+    def click_count_for_code(self, log_path: str, code: str) -> int:
+        """All-time redirect count for a single short code."""
+        return sum(1 for e in self.stream_entries(log_path) if e.get("code") == code)
+
+    def summary_for_date(self, log_path: str, target_date: date) -> dict:
+        """DAU, total clicks, and top-5 codes for target_date in a single log pass."""
+        seen_ips: set[str] = set()
+        click_counts: Counter[str] = Counter()
+        for entry in self.entries_for_date(log_path, target_date):
+            if ip := entry.get("ip"):
+                seen_ips.add(ip)
+            if code := entry.get("code"):
+                click_counts[code] += 1
+        top = sorted(click_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        return {
+            "date": target_date.isoformat(),
+            "dau": len(seen_ips),
+            "total_clicks": sum(click_counts.values()),
+            "top_codes": [{"code": c, "clicks": n} for c, n in top],
+        }
