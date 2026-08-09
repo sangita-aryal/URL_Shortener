@@ -13,7 +13,7 @@ Run directly against a local log file:
 """
 import os
 import sys
-from datetime import date
+from datetime import UTC, date, datetime
 from app.analytics import AnalyticsConsumer
 
 LOG_PATH = os.environ.get("LOG_PATH", "/var/log/url_shortener_analytics.log")
@@ -32,7 +32,7 @@ def main() -> None:
     target = (
         _parse_date(sys.argv[sys.argv.index("--date") + 1])
         if "--date" in sys.argv
-        else date.today()
+        else datetime.now(UTC).date()
     )
 
     consumer = AnalyticsConsumer()
