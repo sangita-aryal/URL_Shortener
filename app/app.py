@@ -132,6 +132,13 @@ class ShortenResponse(BaseModel):
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
+@app.get("/health", include_in_schema=False)
+async def health() -> dict:
+    """Liveness probe consumed by the docker-compose healthcheck."""
+    return {"status": "ok"}
+
+
+
 @app.post("/shorten", response_model=ShortenResponse, status_code=201)
 async def shorten_url(
     body: ShortenRequest,
@@ -181,7 +188,12 @@ async def redirect(
     if url is None:
         raise HTTPException(status_code=404, detail="Short code not found")
 
-    client_ip = request.client.host if request.client else "unknown"
+    # Nginx sets X-Real-IP to the originating client address.
+    # Fall back to the transport-layer peer when running without a proxy.
+    client_ip = (
+        request.headers.get("x-real-ip")
+        or (request.client.host if request.client else "unknown")
+    )
     asyncio.create_task(telemetry.record_redirect(short_code, client_ip))
 
     return Response(status_code=302, headers={"Location": url})
