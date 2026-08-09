@@ -260,6 +260,50 @@ Relevant sources:
 
 ---
 
+## Frontend
+
+A single-page React application that provides a clean UI for shortening URLs.
+
+**Tech:** Vite 5 + React 18 + Tailwind CSS 3 — no Redux, no routing library.
+
+**Features:**
+
+- Centered layout with a large URL input and "Shorten →" button
+- Async `POST /shorten` with loading state (spinner on button)
+- SSRF 400 errors displayed as a "REQUEST BLOCKED" banner with the exact server message
+- Network errors surfaced as a user-friendly fallback message
+- Success panel with the full short URL as a clickable `<a target="_blank" rel="noopener noreferrer">` link and a one-click "Copy" button
+- "Start over" action resets all state and returns focus to the input
+
+### Frontend environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `VITE_API_BASE` | _(empty)_ | Base URL for API calls (e.g. `http://localhost:8000`). Omit in production when the SPA is served behind the same Nginx origin as the API. |
+
+### Running the frontend (development)
+
+```bash
+cd frontend
+npm install
+npm run dev
+# → http://localhost:5173
+```
+
+During development Vite proxies `/shorten` to `http://localhost:8000`, so the FastAPI backend must be running locally on port 8000.
+
+### Building for production
+
+```bash
+cd frontend
+npm run build
+# Static assets emitted to frontend/dist/
+```
+
+Serve `frontend/dist/` from Nginx's root so the SPA and API share the same origin, eliminating CORS and the need for the `VITE_API_BASE` variable.
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Description |
