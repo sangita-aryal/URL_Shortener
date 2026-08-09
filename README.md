@@ -484,7 +484,7 @@ npm run dev
 # → http://localhost:5173
 ```
 
-During development, Vite proxies `/shorten` to `http://localhost:8000`, so the FastAPI backend must be running locally on port 8000.
+During development, Vite proxies `/shorten` to `http://localhost:80` (Nginx). Start the full stack with `docker compose up` before running the frontend dev server — FastAPI is not published directly on the host; all traffic routes through Nginx on port 80.
 
 ### Building for production
 
