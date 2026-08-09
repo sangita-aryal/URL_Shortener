@@ -151,6 +151,63 @@ Relevant source: [`app/ssrf_validator.py`](app/ssrf_validator.py) — `validate_
 
 ---
 
+### 4 — Redis Read-Through Cache (URL Persistence)
+
+**The problem.** Serving one billion redirects per day at ~11,600 QPS means
+the dominant operation is a key lookup by short code. Hitting MongoDB on
+every redirect would saturate the database's read capacity and add network
+round-trip latency to the hot path (target: sub-millisecond redirection).
+
+**The solution.** `URLRepository` implements a read-through cache pattern
+that keeps the hot path entirely in Redis RAM:
+
+```
+Write path — save(short_code, url)
+  insert_one → MongoDB (w="majority", j=True)
+  Redis is NOT touched. Cache population is strictly lazy.
+
+Read path — get(short_code)
+  1. redis.get(short_code)
+     ├─ HIT  → decode bytes → return URL  ← MongoDB never opened
+     └─ MISS → find_one({"_id": short_code})
+               ├─ FOUND     → redis.set(short_code, url) → return URL
+               └─ NOT FOUND → return None  (Redis NOT written)
+```
+
+**Why lazy population on the write path.** Writing to Redis on `save()`
+would couple the write-path latency to two sequential network calls (Mongo
++ Redis). Lazy population means only the first read miss pays that cost;
+every subsequent read for the same code is a sub-millisecond Redis hit.
+
+**Why not write `None` to Redis on a miss.** A short code that does not
+exist today may be created tomorrow. Caching `None` would serve stale
+404s until the TTL expires. The repository intentionally skips the Redis
+write on not-found.
+
+**Durability.** The MongoDB client is configured with `w="majority"` and
+`j=True`. No URL document is acknowledged until it is durably written to a
+majority of replica nodes and flushed to the journal, preventing data loss
+on a primary failover.
+
+**The call sequence is a first-class contract.** The interaction order
+`redis.get → mongo.find_one → redis.set` is enforced by `TestReadOrder`
+using a side-effect call log, not just presence/absence checks.
+
+Relevant source: [`app/url_repository.py`](app/url_repository.py) — `URLRepository`
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `MONGO_URI` | `mongodb://mongo:27017` | MongoDB connection string. Targets the `url_shortener` database. |
+| `REDIS_URI` | `redis://redis:6379` | Redis connection string. Used by `URLRepository` for the read-through cache. |
+| `BASE_URL` | `http://localhost` | Public base URL prepended to short codes in the `POST /shorten` response. |
+| `FEISTEL_KEY_0` – `FEISTEL_KEY_3` | `0xDEADBEEF`, `0xCAFEBABE`, `0x12345678`, `0xABCDEF01` | Four 32-bit Feistel round keys. Rotate per deployment to prevent short-code prediction. |
+
+---
+
 ## Running the Test Suite
 
 The test suite is written with `pytest` and `pytest-asyncio` following a
@@ -163,7 +220,7 @@ implementation code.
 pip install -r requirements.txt
 ```
 
-**Run the full suite (93 tests)**
+**Run the full suite (112 tests)**
 
 ```bash
 pytest tests/ -v
@@ -180,6 +237,7 @@ pytest tests/ -v -m "not slow"
 ```bash
 pytest tests/test_id_generator.py -v
 pytest tests/test_ssrf_validator.py -v
+pytest tests/test_url_repository.py -v
 ```
 
 ### Test coverage
@@ -205,3 +263,8 @@ pytest tests/test_ssrf_validator.py -v
 | | `TestForbiddenSchemes` | `file`, `ftp`, `javascript`, `data`, `gopher`, `dict`; case-insensitive |
 | | `TestMalformedURLs` | Empty string, whitespace, bare hostname, missing host |
 | | `TestDNSRebindingDefence` | DNS rebinding (hostname resolves to private IP); `aiodns.error.DNSError` → block |
+| `test_url_repository.py` | `TestWritePath` | `save()` calls `insert_one` once with `{"_id": code, "url": url}`; `redis.get` and `redis.set` are never called |
+| | `TestCacheHit` | Redis hit → URL decoded from bytes returned; `find_one` not called; `redis.set` not called; `redis.get` called with short code |
+| | `TestCacheMiss` | Redis miss → `find_one` called with `{"_id": code}`; URL returned; `redis.set` called once with `(code, url)` as positional args |
+| | `TestNotFound` | Both stores return nothing → `None` returned; `redis.set` never called (no null-cache poisoning) |
+| | `TestReadOrder` | Hit: `redis.get` called before `find_one` is ever reached; Miss: side-effect log asserts exact sequence `redis.get → mongo.find_one → redis.set` |
