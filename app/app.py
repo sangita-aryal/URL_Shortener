@@ -10,6 +10,7 @@ Design mandates enforced here:
   - Network isolation: this server binds only on the private network; Nginx
     is the sole public-facing component (see docker-compose.yml).
 """
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -22,6 +23,7 @@ from pydantic import BaseModel
 
 from app.id_generator import FeistelCipher, IDGenerator, SequenceLeaseManager
 from app.ssrf_validator import SSRFValidationError, validate_url
+from app.telemetry import TelemetryLogger
 from app.url_repository import URLRepository
 
 # ── Feistel round keys ────────────────────────────────────────────────────────
@@ -37,6 +39,7 @@ _FEISTEL_KEYS: list[int] = [
 _MONGO_URI: str = os.environ.get("MONGO_URI", "mongodb://mongo:27017")
 _REDIS_URI: str = os.environ.get("REDIS_URI", "redis://redis:6379")
 _BASE_URL: str = os.environ.get("BASE_URL", "http://localhost")
+_LOG_PATH:  str = os.environ.get("LOG_PATH", "/var/log/url_shortener_analytics.log")
 
 
 # ── Application lifespan ──────────────────────────────────────────────────────
@@ -65,6 +68,7 @@ async def lifespan(app: FastAPI):
         collection=db["urls"],
         redis_client=redis_client,
     )
+    app.state.telemetry = TelemetryLogger(log_path=_LOG_PATH)
 
     yield
 
@@ -103,11 +107,16 @@ def get_url_repo(request: Request) -> URLRepository:
     return request.app.state.url_repo
 
 
+def get_telemetry(request: Request) -> TelemetryLogger:
+    return request.app.state.telemetry
+
+
 # ── Convenience type aliases for route signatures ─────────────────────────────
 
-ResolverDep = Annotated[aiodns.DNSResolver, Depends(get_resolver)]
-IDGenDep    = Annotated[IDGenerator,         Depends(get_id_generator)]
-RepoDep     = Annotated[URLRepository,       Depends(get_url_repo)]
+ResolverDep   = Annotated[aiodns.DNSResolver, Depends(get_resolver)]
+IDGenDep      = Annotated[IDGenerator,         Depends(get_id_generator)]
+RepoDep       = Annotated[URLRepository,       Depends(get_url_repo)]
+TelemetryDep  = Annotated[TelemetryLogger,     Depends(get_telemetry)]
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -151,7 +160,12 @@ async def shorten_url(
 
 
 @app.get("/{short_code}")
-async def redirect(short_code: str, repo: RepoDep) -> Response:
+async def redirect(
+    short_code: str,
+    request: Request,
+    repo: RepoDep,
+    telemetry: TelemetryDep,
+) -> Response:
     """
     Read path: look up the original URL and return HTTP 302.
 
@@ -159,8 +173,15 @@ async def redirect(short_code: str, repo: RepoDep) -> Response:
     MongoDB on a miss with lazy Redis population).
     The URL is placed directly in the Location header — no server-side
     fetch avoids a secondary SSRF surface (architect.md §4).
+
+    Telemetry is scheduled as a background asyncio task so the 302
+    is returned before the log write touches disk.
     """
     url = await repo.get(short_code)
     if url is None:
         raise HTTPException(status_code=404, detail="Short code not found")
+
+    client_ip = request.client.host if request.client else "unknown"
+    asyncio.create_task(telemetry.record_redirect(short_code, client_ip))
+
     return Response(status_code=302, headers={"Location": url})
