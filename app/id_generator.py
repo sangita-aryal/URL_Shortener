@@ -80,9 +80,9 @@ class SequenceLeaseManager:
     any single asyncio event loop (one per Uvicorn worker process).
     """
 
-    DEFAULT_LEASE_SIZE: int = 1_000_000
+    DEFAULT_LEASE_SIZE: int = 10_000
 
-    def __init__(self, collection, *, lease_size: int = 1_000_000) -> None:
+    def __init__(self, collection, *, lease_size: int = 10_000) -> None:
         self._collection = collection
         self._lease_size = lease_size
         self._current: int = 0
