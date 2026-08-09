@@ -4,9 +4,7 @@ import react from '@vitejs/plugin-react';
 export default defineConfig({
   plugins: [react()],
   server: {
-    port: 5173,
-    // Proxy API calls to the FastAPI backend during local development.
-    // In production, Nginx routes /shorten and /{short_code} directly.
+    port: process.env.PORT ? parseInt(process.env.PORT) : 5173,
     proxy: {
       '/shorten': { target: 'http://localhost:8000', changeOrigin: true },
     },
