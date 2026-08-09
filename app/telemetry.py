@@ -19,7 +19,7 @@ Design constraints enforced here:
 """
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 class TelemetryLogger:
@@ -28,13 +28,13 @@ class TelemetryLogger:
 
     async def record_redirect(self, short_code: str, client_ip: str) -> None:
         entry = json.dumps({
-            "ts":   datetime.now(timezone.utc).isoformat(),
+            "ts":   datetime.now(UTC).isoformat(),
             "code": short_code,
             "ip":   client_ip,
         })
         try:
             await asyncio.to_thread(self._append, entry)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 — telemetry loss is preferable to a failed redirect
             pass
 
     def _append(self, line: str) -> None:

@@ -35,12 +35,9 @@ API contracts under test (not yet implemented):
 import asyncio
 import inspect
 import json
-from datetime import date, datetime, timezone
-
-import pytest
+from datetime import UTC, date, datetime
 
 from app.telemetry import TelemetryLogger
-from app.analytics import AnalyticsConsumer
 
 # RFC 5737 TEST-NET addresses — safe for documentation and tests
 _CODE  = "aB3cD4e"
@@ -54,13 +51,12 @@ _IP2   = "198.51.100.7"   # TEST-NET-2
 def _write_log_lines(path: str, lines: list[str]) -> None:
     """Write raw log lines to a file for consumer-side tests."""
     with open(path, "w") as f:
-        for line in lines:
-            f.write(line + "\n")
+        f.writelines(line + "\n" for line in lines)
 
 
 def _make_entry(code: str, ip: str, dt: datetime | None = None) -> str:
     """Build a valid JSON log line matching TelemetryLogger's output format."""
-    ts = (dt or datetime.now(timezone.utc)).isoformat()
+    ts = (dt or datetime.now(UTC)).isoformat()
     return json.dumps({"ts": ts, "code": code, "ip": ip})
 
 
@@ -143,7 +139,7 @@ class TestLogEntryTimestamp:
         )
 
     async def test_timestamp_reflects_current_utc_date(self, telemetry_logger, log_path):
-        today = datetime.now(timezone.utc).date()
+        today = datetime.now(UTC).date()
         await telemetry_logger.record_redirect(_CODE, _IP)
         with open(log_path) as f:
             entry = json.loads(f.read().strip())
@@ -375,8 +371,8 @@ class TestDateIsolation:
     def test_entries_for_today_excludes_yesterday(self, analytics_consumer, log_path):
         today = date(2026, 8, 9)
         _write_log_lines(log_path, [
-            _make_entry(_CODE,  _IP,  datetime(2026, 8, 9, 10, 0, tzinfo=timezone.utc)),
-            _make_entry(_CODE2, _IP2, datetime(2026, 8, 8, 10, 0, tzinfo=timezone.utc)),
+            _make_entry(_CODE,  _IP,  datetime(2026, 8, 9, 10, 0, tzinfo=UTC)),
+            _make_entry(_CODE2, _IP2, datetime(2026, 8, 8, 10, 0, tzinfo=UTC)),
         ])
         entries = list(analytics_consumer.entries_for_date(log_path, today))
         assert len(entries) == 1
@@ -385,8 +381,8 @@ class TestDateIsolation:
     def test_entries_for_yesterday_excludes_today(self, analytics_consumer, log_path):
         yesterday = date(2026, 8, 8)
         _write_log_lines(log_path, [
-            _make_entry(_CODE,  _IP,  datetime(2026, 8, 9, 10, 0, tzinfo=timezone.utc)),
-            _make_entry(_CODE2, _IP2, datetime(2026, 8, 8, 10, 0, tzinfo=timezone.utc)),
+            _make_entry(_CODE,  _IP,  datetime(2026, 8, 9, 10, 0, tzinfo=UTC)),
+            _make_entry(_CODE2, _IP2, datetime(2026, 8, 8, 10, 0, tzinfo=UTC)),
         ])
         entries = list(analytics_consumer.entries_for_date(log_path, yesterday))
         assert len(entries) == 1
@@ -395,7 +391,7 @@ class TestDateIsolation:
     def test_entries_for_date_returns_a_generator(self, analytics_consumer, log_path):
         """The filter itself must be lazy — no bulk reads into memory."""
         _write_log_lines(log_path, [
-            _make_entry(_CODE, _IP, datetime(2026, 8, 9, 10, 0, tzinfo=timezone.utc)),
+            _make_entry(_CODE, _IP, datetime(2026, 8, 9, 10, 0, tzinfo=UTC)),
         ])
         result = analytics_consumer.entries_for_date(log_path, date(2026, 8, 9))
         assert inspect.isgenerator(result)
@@ -408,9 +404,9 @@ class TestDateIsolation:
         """
         today = date(2026, 8, 9)
         _write_log_lines(log_path, [
-            _make_entry(_CODE, _IP,  datetime(2026, 8, 9, 10, 0, tzinfo=timezone.utc)),
-            _make_entry(_CODE, _IP,  datetime(2026, 8, 9, 14, 0, tzinfo=timezone.utc)),
-            _make_entry(_CODE, _IP2, datetime(2026, 8, 8, 10, 0, tzinfo=timezone.utc)),
+            _make_entry(_CODE, _IP,  datetime(2026, 8, 9, 10, 0, tzinfo=UTC)),
+            _make_entry(_CODE, _IP,  datetime(2026, 8, 9, 14, 0, tzinfo=UTC)),
+            _make_entry(_CODE, _IP2, datetime(2026, 8, 8, 10, 0, tzinfo=UTC)),
         ])
         filtered = analytics_consumer.entries_for_date(log_path, today)
         assert analytics_consumer.compute_dau(filtered) == 1

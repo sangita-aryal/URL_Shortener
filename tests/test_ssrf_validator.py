@@ -24,7 +24,6 @@ The `resolver` parameter is a live aiodns.DNSResolver passed from the FastAPI
 app-state lifespan.  Tests inject an AsyncMock in its place.
 """
 import socket
-from unittest.mock import AsyncMock, call
 
 import pytest
 
