@@ -407,15 +407,16 @@ load balancing from Nginx's upstream block. Add replica `server` lines to
 
 | Service | Public port | Network |
 |---|---|---|
-| `nginx` | **80** | `internal` |
+| `nginx` | **80** (HTTP→HTTPS redirect), **443** (TLS) | `internal` |
 | `fastapi` | none | `internal` |
 | `redis` | none | `internal` |
 | `mongo` | none | `internal` |
 
 No FastAPI, Redis, or MongoDB port is published to the host. External traffic
-can only enter through Nginx on port 80. The bridge is not flagged
-`internal: true` so FastAPI workers retain outbound connectivity for aiodns
-SSRF validation.
+enters through Nginx on port 443 (TLS-terminated); port 80 issues a permanent
+301 redirect to HTTPS so no plaintext application traffic reaches the network.
+The bridge is not flagged `internal: true` so FastAPI workers retain outbound
+connectivity for aiodns SSRF validation.
 
 ### Liveness probe
 
@@ -590,8 +591,18 @@ Short codes are permanent. There is no TTL on URL documents in MongoDB and no `D
 
 ---
 
-### 8.10 No HTTPS in the Compose Stack
+### 8.10 TLS — Self-Signed Certificate, CA Sign-Off Required Before Internal Deployment
 
-Nginx listens on port 80 (HTTP only). There is no TLS termination, no certificate management, and no HTTP→HTTPS redirect. All traffic between client and Nginx — including the full destination URL in `POST /shorten` request bodies — is transmitted in plaintext.
+**Risk classification: unmitigated security risk without explicit security sign-off.**
 
-**For production:** provision a TLS certificate (Let's Encrypt / ACM), add a `listen 443 ssl` block to `nginx.conf`, configure `ssl_certificate` and `ssl_certificate_key`, and add a port 80 → 443 redirect. Alternatively, terminate TLS at a cloud load balancer upstream of Nginx.
+Without encryption in transit, `POST /shorten` request bodies are visible in plaintext to any process on the host network. In internal tooling, destination URLs frequently carry OAuth authorisation codes, session tokens, and sensitive query parameters — making plaintext transmission a data-exposure risk regardless of whether the network is "private."
+
+**What is in place:** The Compose stack now terminates TLS at Nginx using a self-signed RSA-2048 certificate generated at image build time (`nginx/Dockerfile`). Port 80 issues a permanent HTTP 301 → HTTPS redirect; no plaintext application traffic reaches the network. TLSv1.0 and TLSv1.1 are explicitly excluded (`ssl_protocols TLSv1.2 TLSv1.3`) in compliance with RFC 8996 and PCI-DSS 3.2+.
+
+**What requires sign-off before internal deployment:**
+
+- **Certificate authority.** The self-signed cert triggers browser warnings and provides no identity assurance. Replace with a CA-signed certificate (internal PKI, Let's Encrypt, or ACM) before any internal deployment. This step requires the security team to approve the CA chain and validate the SAN list.
+- **Certificate rotation.** No automated renewal is configured. Manual rotation before the 10-year expiry must be scheduled and owned by the operating team.
+- **mTLS for service-to-service traffic.** Traffic between Nginx and FastAPI travels over the unencrypted Docker bridge. For a regulated environment, mutual TLS between all service pairs (or a service mesh with automatic cert provisioning) is the production-grade control.
+
+**Production path:** replace the self-signed cert with a CA-signed certificate, add OCSP stapling (`ssl_stapling on`), and terminate mTLS at the service mesh layer or via a sidecar proxy.
