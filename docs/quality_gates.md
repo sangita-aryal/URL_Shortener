@@ -1,7 +1,7 @@
 # Quality Gates Report
 
 **Project:** URL Shortener  
-**Run Date:** 2026-08-09  
+**Run Date:** 2026-08-10  
 **Branch:** feature/final_hardening  
 **Python:** 3.13.0  
 **Tools:** ruff 0.x · bandit 1.9.4 · pytest-cov 7.1.0
@@ -14,7 +14,7 @@
 |---|---|---|---|
 | Linting | ruff | **PASS** | 0 issues |
 | Security scan | bandit | **PASS** | 1 Low / 0 Medium / 0 High |
-| Test suite | pytest | **PASS** | 204 / 204 passed (1.22 s) |
+| Test suite | pytest | **PASS** | 204 / 204 passed (1.27 s) |
 | Test coverage | pytest-cov | **PASS** | 92% overall |
 
 ---
@@ -101,7 +101,7 @@ No injection vulnerabilities, hardcoded secrets, weak cryptography, insecure des
 ## 3. Test Suite — pytest
 
 **Command:** `pytest tests/ --cov=app --cov-report=term-missing`  
-**Result:** PASS — 204 / 204 passed in 1.22 s
+**Result:** PASS — 204 / 204 passed in 1.27 s
 
 ### Results by module
 

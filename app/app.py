@@ -38,9 +38,9 @@ _FEISTEL_KEYS: list[int] = [
     int(os.environ.get("FEISTEL_KEY_3", str(0xABCD_EF01))),
 ]
 
-_MONGO_URI: str = os.environ.get("MONGO_URI", "mongodb://mongo:27017")
+_MONGO_URI: str = os.environ.get("MONGO_URI", "mongodb://mongo:27017/?replicaSet=rs0")
 _REDIS_URI: str = os.environ.get("REDIS_URI", "redis://redis:6379")
-_BASE_URL: str = os.environ.get("BASE_URL", "http://localhost")
+_BASE_URL: str = os.environ.get("BASE_URL", "https://localhost")
 _LOG_PATH:  str = os.environ.get("LOG_PATH", "/var/log/url_shortener_analytics.log")
 
 

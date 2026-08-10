@@ -57,7 +57,7 @@ services:
     environment:
       MONGO_URI:     "mongodb://mongo:27017/?replicaSet=rs0"
       REDIS_URI:     "redis://redis:6379"
-      BASE_URL:      "http://localhost"
+      BASE_URL:      "https://localhost"
       LOG_PATH:      "/var/log/url_shortener_analytics.log"
       # Feistel round keys — rotate these values per deployment to prevent
       # short-code enumeration attacks.  Defaults match the test fixtures.

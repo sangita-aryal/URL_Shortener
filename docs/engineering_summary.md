@@ -13,8 +13,8 @@ The system is a four-layer stack: Nginx API gateway → stateless FastAPI worker
 | Artifact | Location | Purpose |
 |---|---|---|
 | Core application | `app/` | FastAPI app, ID generation, SSRF validation, persistence, telemetry, analytics |
-| Test suite | `tests/` | 172 contract tests; written before implementation in every case |
-| Docker stack | `docker-compose.yaml`, `Dockerfile`, `nginx/nginx.conf` | Full runnable stack: Nginx, FastAPI, Redis, MongoDB replica set |
+| Test suite | `tests/` | 204 contract tests; written before implementation in every case |
+| Docker stack | `docker-compose.yaml`, `Dockerfile`, `nginx/Dockerfile`, `nginx/nginx.conf` | Full runnable stack: Nginx (TLS), FastAPI, Redis, MongoDB replica set |
 | React frontend | `frontend/` | Single-page app for URL shortening; Vite + Tailwind |
 | Analytics report script | `scripts/report.py` | Offline CLI report: DAU, total clicks, top-N codes for a given date |
 | Architecture documentation | `README.md` | Capacity planning, ADRs, setup instructions, limitations |
@@ -88,9 +88,9 @@ See README §8 for the full list. The most operationally significant:
 
 In priority order, if this were moving toward production:
 
-1. Add `tests/test_app.py` integration tests using `TestClient` to cover the `POST /shorten` and `GET /{code}` routes — the two highest-traffic endpoints currently at 0% coverage
-2. Add TLS termination to Nginx (`listen 443 ssl`, Let's Encrypt or ACM)
-3. Replace the single-node replica set with a three-member cluster across separate hosts
-4. Add Redis AOF persistence so the cache survives container restarts
-5. Precompute daily analytics into MongoDB to eliminate log-file reads on the HTTP path
-6. Add URL expiration support (TTL index on `expires_at` in MongoDB, matching Redis TTL)
+1. Replace the self-signed TLS certificate with a CA-signed cert (internal PKI, Let's Encrypt, or ACM) and configure OCSP stapling — required before any internal deployment per §8.10
+2. Replace the single-node replica set with a three-member cluster across separate hosts
+3. Add Redis AOF persistence so the cache survives container restarts
+4. Precompute daily analytics into MongoDB to eliminate log-file reads on the HTTP path
+5. Add URL expiration support (TTL index on `expires_at` in MongoDB, matching Redis TTL)
+6. Wire `frontend/dist/` into the Nginx image so the SPA and API are served from the same origin without a separate manual build step

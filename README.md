@@ -45,6 +45,8 @@ FastAPI worker 0      FastAPI worker N     ← 100% stateless. No session
    └─── write/miss ────────┴──▶  MongoDB sharded cluster
 ```
 
+> **Local Compose vs. production architecture.** The diagram above shows the production target. `docker compose up` in this repository deploys a single Redis instance and a single-node MongoDB replica set (`rs0`) — sufficient for development and evaluation, not for production HA.
+
 | Layer | Technology | Role |
 |---|---|---|
 | Edge Proxy / API Gateway | Containerized Nginx (Layer 7) | Public entry point; rate limiting, SSL termination, slow-client buffering |
@@ -295,12 +297,6 @@ pip install -r requirements.txt
 pytest tests/ -v
 ```
 
-### Run without slow throughput benchmarks
-
-```bash
-pytest tests/ -v -m "not slow"
-```
-
 ### Run a single module
 
 ```bash
@@ -345,6 +341,15 @@ pytest tests/test_telemetry.py -v
 | | `TestDAUComputation` | One IP → 1; same IP twice → 1 (dedup); two IPs → 2; empty → 0; 1,000 entries / 500 unique IPs → 500; return type is `int` |
 | | `TestClickComputation` | One click → 1; two clicks same code → 2; two codes counted independently; empty → `{}`; values are `int` |
 | | `TestDateIsolation` | Today's filter excludes yesterday; yesterday's filter excludes today; `entries_for_date` is a generator; full pipeline `entries_for_date → compute_dau` excludes prior-day IPs |
+| `test_stats_analytics.py` | `TestClickCountForCode` | 0 for empty log; counts matching entries; excludes non-matching; unknown code → 0; return type is `int` |
+| | `TestSummaryForDate` | DAU deduplicates IPs; total_clicks counts all entries; top_codes sorted descending; capped at 5; cross-date entries excluded; single-pass (no double read) |
+| | `TestStatsEndpoint` | `GET /stats/{code}` returns 200; correct click count; unknown code → 0 not 404; response shape `{code, total_clicks}` |
+| | `TestAnalyticsEndpoint` | `GET /analytics` returns 200; correct shape; default date is today UTC; explicit date param; invalid date → 422; DAU/clicks correct; top_codes sorted; date isolation |
+| `test_app.py` | `TestShortenRoute` | `POST /shorten` with valid URL → 201 + `short_code` + `short_url`; SSRF-blocked URL → 400; invalid body → 422 |
+| | `TestRedirectRoute` | `GET /{short_code}` for known code → 302 + `Location` header; unknown code → 404; telemetry task scheduled |
+| `test_tls_config.py` | `TestNginxTLS` | `listen 443 ssl` present; cert and key configured; `ssl_protocols` excludes TLSv1.0/1.1; port 80 issues 301 redirect; no `proxy_pass` on port 80 |
+| | `TestComposeExposesHttps` | Port 443 exposed; port 80 still exposed; nginx built from `./nginx` not pulled as image |
+| | `TestNginxDockerfile` | `nginx/Dockerfile` exists; installs openssl; generates `.crt` and `.key`; `chmod 600` on private key |
 
 ---
 
@@ -354,7 +359,7 @@ pytest tests/test_telemetry.py -v
 |---|---|---|
 | `MONGO_URI` | `mongodb://mongo:27017/?replicaSet=rs0` | MongoDB connection string. Must include `replicaSet=rs0` when running via Compose so Motor can enforce `w="majority"` write concerns. |
 | `REDIS_URI` | `redis://redis:6379` | Redis connection string. Used by `URLRepository` for the read-through cache. |
-| `BASE_URL` | `http://localhost` | Public base URL prepended to short codes in the `POST /shorten` response. |
+| `BASE_URL` | `https://localhost` | Public base URL prepended to short codes in the `POST /shorten` response. Must use `https://` when Nginx terminates TLS. |
 | `LOG_PATH` | `/var/log/url_shortener_analytics.log` | Append-only telemetry log written by `TelemetryLogger`. Feed this path to `AnalyticsConsumer` for offline DAU and click aggregation. |
 | `FEISTEL_KEY_0` – `FEISTEL_KEY_3` | `0xDEADBEEF`, `0xCAFEBABE`, `0x12345678`, `0xABCDEF01` | Four 32-bit Feistel round keys. Rotate per deployment to prevent short-code prediction. |
 
@@ -372,7 +377,8 @@ pytest tests/test_telemetry.py -v
 docker-compose.yaml   — full stack definition
 Dockerfile            — FastAPI image (python:3.13-slim + uvicorn)
 .dockerignore         — excludes tests/, docs, and dev artefacts from the build context
-nginx/nginx.conf      — rate limiting, keepalive upstream, X-Real-IP forwarding
+nginx/Dockerfile      — custom Nginx image: nginx:1.27-alpine + self-signed TLS cert
+nginx/nginx.conf      — TLS termination, HTTP→HTTPS redirect, rate limiting, upstream proxy
 scripts/report.py     — offline analytics report (run via the analytics profile)
 ```
 
@@ -382,7 +388,7 @@ scripts/report.py     — offline analytics report (run via the analytics profil
 docker compose up --build
 ```
 
-This starts six services in dependency order:
+This starts five services in dependency order (the sixth — `analytics` — is opt-in via `--profile analytics` and does not start here):
 
 ```
 mongo → mongo-init → fastapi → nginx
@@ -486,7 +492,7 @@ npm run dev
 # → http://localhost:5173
 ```
 
-During development, Vite proxies `/shorten` to `http://localhost:80` (Nginx). Start the full stack with `docker compose up` before running the frontend dev server — FastAPI is not published directly on the host; all traffic routes through Nginx on port 80.
+During development, Vite proxies `/shorten` to `https://localhost:443` (Nginx TLS). Start the full stack with `docker compose up --build` before running the frontend dev server — FastAPI is not published directly on the host; all traffic routes through Nginx. The proxy is configured with `secure: false` to accept the self-signed development certificate without browser intervention.
 
 ### Building for production
 
@@ -496,7 +502,7 @@ npm run build
 # Static assets emitted to frontend/dist/
 ```
 
-Serve `frontend/dist/` from Nginx's root so the SPA and API share the same origin, eliminating CORS and the need for `VITE_API_BASE`.
+**This is a manual step — `frontend/dist/` is not wired into the Compose stack or Nginx image.** To serve the SPA from Nginx (eliminating CORS and the need for `VITE_API_BASE`), copy `frontend/dist/` into the Nginx image and add a `root` and `try_files` directive to `nginx/nginx.conf`. This step is not automated in the current Compose configuration.
 
 ---
 
@@ -575,11 +581,28 @@ The SSRF validator resolves the target hostname at URL creation time. There is a
 
 ---
 
-### 8.8 Analytics — Offline Only, No Real-Time Dashboard
+### 8.8 Analytics — Batch Only, No Real-Time Dashboard
 
-The `AnalyticsConsumer` reads from the log file offline. There is no streaming aggregation, no real-time dashboard, and no alerting. Metrics are available only by running `docker compose --profile analytics run --rm analytics`, which produces a point-in-time report.
+Two analytics surfaces are available, both reading from the append-only telemetry log file:
 
-**To add real-time analytics:** replace the file-append log with a message queue (Kafka, Redis Streams) and add a streaming consumer (Flink, Spark Structured Streaming, or a simple asyncio consumer). This was explicitly out of scope to avoid adding queue infrastructure to a system that already manages five containers.
+**HTTP API (in-process):**
+- `GET /stats/{code}` — all-time click count for a single short code. Returns `{"code": "…", "total_clicks": N}`. Returns 0 for unknown codes (not 404).
+- `GET /analytics?date=YYYY-MM-DD` — daily summary: DAU (unique IPs), total clicks, top-5 codes by click volume. Defaults to today UTC when `date` is omitted.
+
+Both endpoints offload the file read to `asyncio.to_thread` to avoid blocking the event loop.
+
+**CLI report (Docker profile):**
+
+```bash
+docker compose --profile analytics run --rm analytics
+docker compose --profile analytics run --rm analytics --date 2026-08-09
+```
+
+Produces a formatted table: DAU, total redirects, top-N short codes. Defaults to today UTC.
+
+**Shared limitation:** both surfaces read the log file on demand. At high log volumes (10 GB/day) a single request or report run could take several seconds. There is no streaming aggregation, no real-time dashboard, and no alerting.
+
+**To add real-time analytics:** replace the file-append log with a message queue (Kafka, Redis Streams) and add a streaming consumer (Flink, Spark Structured Streaming, or a simple asyncio consumer). This was explicitly out of scope to avoid adding queue infrastructure to a system that already manages five services.
 
 ---
 
