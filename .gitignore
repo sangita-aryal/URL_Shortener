@@ -57,3 +57,6 @@ dmypy.json
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
+
+# AI tool settings (machine-local IDE config — contains dev paths and permission grants)
+.claude/
