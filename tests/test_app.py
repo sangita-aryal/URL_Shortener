@@ -28,7 +28,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-
 # ── Mock factories ────────────────────────────────────────────────────────────
 
 def _make_mock_id_gen(short_code: str = "test123") -> MagicMock:

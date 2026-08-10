@@ -14,8 +14,8 @@
 |---|---|---|---|
 | Linting | ruff | **PASS** | 0 issues |
 | Security scan | bandit | **PASS** | 1 Low / 0 Medium / 0 High |
-| Test suite | pytest | **PASS** | 172 / 172 passed (1.10 s) |
-| Test coverage | pytest-cov | **PASS** | 87% overall |
+| Test suite | pytest | **PASS** | 190 / 190 passed (1.41 s) |
+| Test coverage | pytest-cov | **PASS** | 92% overall |
 
 ---
 
@@ -83,7 +83,7 @@ except Exception:  # noqa: BLE001, S110
 ### Scan metrics
 
 ```
-Total lines of code scanned : 525
+Total lines of code scanned : 526
 Total lines skipped          : 0
 
 Total issues (by severity):
@@ -94,31 +94,32 @@ Total issues (by severity):
 Files skipped: 0
 ```
 
-No injection vulnerabilities, hardcoded secrets, weak cryptography, insecure deserialization, or unsafe subprocess usage found across 525 lines.
+No injection vulnerabilities, hardcoded secrets, weak cryptography, insecure deserialization, or unsafe subprocess usage found across 526 lines.
 
 ---
 
 ## 3. Test Suite — pytest
 
 **Command:** `pytest tests/ --cov=app --cov-report=term-missing`  
-**Result:** PASS — 172 / 172 passed in 1.10 s
+**Result:** PASS — 190 / 190 passed in 1.41 s
 
 ### Results by module
 
 | Test file | Tests | Result |
 |---|---|---|
+| `tests/test_app.py` | 18 | PASS |
 | `tests/test_id_generator.py` | 37 | PASS |
 | `tests/test_ssrf_validator.py` | 53 | PASS |
 | `tests/test_stats_analytics.py` | 26 | PASS |
 | `tests/test_telemetry.py` | 35 | PASS |
 | `tests/test_url_repository.py` | 21 | PASS |
-| **Total** | **172** | **PASS** |
+| **Total** | **190** | **PASS** |
 
 ---
 
 ## 4. Test Coverage — pytest-cov
 
-**Result:** 87% overall (305 statements, 39 missed)
+**Result:** 92% overall (306 statements, 26 missed)
 
 ### Coverage by module
 
@@ -126,24 +127,24 @@ No injection vulnerabilities, hardcoded secrets, weak cryptography, insecure des
 |---|---|---|---|---|
 | `app/__init__.py` | 0 | 0 | **100%** | — |
 | `app/analytics.py` | 53 | 2 | **96%** | 50–51 |
-| `app/app.py` | 98 | 33 | **66%** | 57–79, 89, 93, 97, 106, 110, 114, 118, 163, 180–188, 240–252 |
+| `app/app.py` | 99 | 20 | **80%** | 57–79, 89, 93, 97, 106, 110, 114, 118, 163 |
 | `app/id_generator.py` | 73 | 2 | **97%** | 27, 32 |
 | `app/ssrf_validator.py` | 50 | 2 | **96%** | 45–46 |
 | `app/telemetry.py` | 15 | 0 | **100%** | — |
 | `app/url_repository.py` | 16 | 0 | **100%** | — |
-| **TOTAL** | **305** | **39** | **87%** | |
+| **TOTAL** | **306** | **26** | **92%** | |
 
 ### Coverage improvement
 
-The addition of `tests/test_stats_analytics.py` (26 tests) brought `app/app.py` from **0% → 66%** by exercising the two new endpoints via `httpx.AsyncClient` with a null lifespan fixture. The brownfield and ambiguous features account for the coverage gain.
+The addition of `tests/test_stats_analytics.py` (26 tests) brought `app/app.py` from **0% → 66%** by exercising the two new endpoints via `httpx.AsyncClient` with a null lifespan fixture. The subsequent addition of `tests/test_app.py` (18 integration tests for `POST /shorten` and `GET /{short_code}`) pushed overall coverage from **87% → 92%** and `app/app.py` from **66% → 80%**.
 
 ### Coverage gap detail
 
-#### `app/app.py` — 66%
+#### `app/app.py` — 80%
 
-Missing lines are the lifespan startup/shutdown block (lines 57–79) and the DI provider functions for MongoDB, Redis, and existing routes (shorten, redirect). These require a live stack to exercise. The new `/stats` and `/analytics` endpoints are fully covered via the endpoint tests.
+Missing lines are the lifespan startup/shutdown block (lines 57–79) and the DI provider functions for MongoDB, Redis, and the resolver (lines 89–118, 163). These require live MongoDB/Redis connections to exercise. All route handlers (`POST /shorten`, `GET /{short_code}`, `GET /stats/{code}`, `GET /analytics`) are now covered.
 
-**Path to remaining coverage:** A `docker compose` integration test harness, or mocking `motor` / `aioredis` at import time in a `test_app.py` fixture.
+**Path to remaining coverage:** Spin up a real MongoDB/Redis in CI (e.g. via `docker compose` service fixtures) to exercise the lifespan block and DI providers.
 
 #### `app/analytics.py` — 96% (lines 50–51)
 
@@ -192,4 +193,4 @@ All tools are included in `requirements.txt` — no separate install step needed
 | 2 | Add missing `TypeError` constructor tests to `TestFeistelCipherRoundCount` | 15 min | `app/id_generator.py` 97% → 100% |
 | 3 | Add malformed-`ts` test to `TestDateIsolation` | 10 min | `app/analytics.py` 95% → 100% |
 | 4 | Add `_is_blocked_address` edge-case test | 10 min | `app/ssrf_validator.py` 96% → 100% |
-| 5 | Add `tests/test_app.py` integration tests with `TestClient` | 2–4 hrs | `app/app.py` 0% → meaningful coverage; validates full HTTP round-trip |
+| 5 | Add live-stack CI fixtures (MongoDB + Redis via Compose) | 2–4 hrs | Covers lifespan block and DI providers; `app/app.py` 80% → 95%+ |
