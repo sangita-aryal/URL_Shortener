@@ -1,7 +1,7 @@
 # ── URL Shortener — System Orchestration ────────────────────────────────────
 #
 # Network isolation contract (architect.md §2):
-#   • Nginx is the ONLY service with a host-mapped port (80).
+#   • Nginx is the ONLY service with host-mapped ports (80 redirect, 443 TLS).
 #   • FastAPI, Redis, and MongoDB are attached to the `internal` bridge
 #     network only.  They have no published ports and are unreachable
 #     from outside this Compose stack.
@@ -32,9 +32,10 @@ services:
   # applies rate limiting, and reverse-proxies to the FastAPI upstream.
   # ──────────────────────────────────────────────────────────────────────────
   nginx:
-    image: nginx:1.27-alpine
+    build: ./nginx                       # custom image: nginx:1.27-alpine + self-signed TLS cert
     ports:
-      - "80:80"                          # ← only public ingress point
+      - "80:80"                          # HTTP → HTTPS redirect only (no plaintext app traffic)
+      - "443:443"                        # ← TLS-terminated public ingress
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     networks:

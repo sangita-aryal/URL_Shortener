@@ -50,7 +50,7 @@ The architecture was derived from capacity numbers, not from defaults. The key c
 
 **Single-node replica set.** A true multi-node replica set requires multiple physical hosts or a complex single-host Compose configuration with replicated volumes. The single-node `rs0` configuration supports `w="majority"` write concerns (the primary durability requirement) without that operational complexity. It is not truly HA — a crashed `mongo` container has no secondary to elect — but `restart: unless-stopped` limits exposure.
 
-**No HTTPS.** TLS termination and certificate management are out of scope for a prototype. All traffic between client and Nginx is plaintext. See README §8.10 for the production path.
+**Self-signed TLS, not CA-signed.** The Compose stack terminates TLS at Nginx with a self-signed RSA-2048 certificate generated at build time. Port 80 redirects permanently to HTTPS; TLSv1.0/1.1 are excluded. Plaintext on the wire is eliminated. What remains before internal deployment: replace the self-signed cert with a CA-signed certificate, configure OCSP stapling, and obtain explicit security sign-off — the cert itself carries no identity assurance and will trigger browser warnings. See README §8.10.
 
 ### Residual risks
 
@@ -76,7 +76,7 @@ The architecture was derived from capacity numbers, not from defaults. The key c
 
 See README §8 for the full list. The most operationally significant:
 
-- No HTTPS in the Compose stack (§8.10)
+- TLS in place (self-signed cert); CA sign-off and cert rotation required before internal deployment (§8.10)
 - Single-node replica set is not HA (§8.1)
 - Redis has no persistence — cache is lost on container restart (§8.2)
 - Nginx upstream does not auto-discover new FastAPI replicas (§8.3)

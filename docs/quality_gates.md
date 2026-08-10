@@ -14,7 +14,7 @@
 |---|---|---|---|
 | Linting | ruff | **PASS** | 0 issues |
 | Security scan | bandit | **PASS** | 1 Low / 0 Medium / 0 High |
-| Test suite | pytest | **PASS** | 190 / 190 passed (1.41 s) |
+| Test suite | pytest | **PASS** | 204 / 204 passed (1.22 s) |
 | Test coverage | pytest-cov | **PASS** | 92% overall |
 
 ---
@@ -101,7 +101,7 @@ No injection vulnerabilities, hardcoded secrets, weak cryptography, insecure des
 ## 3. Test Suite — pytest
 
 **Command:** `pytest tests/ --cov=app --cov-report=term-missing`  
-**Result:** PASS — 190 / 190 passed in 1.41 s
+**Result:** PASS — 204 / 204 passed in 1.22 s
 
 ### Results by module
 
@@ -112,8 +112,9 @@ No injection vulnerabilities, hardcoded secrets, weak cryptography, insecure des
 | `tests/test_ssrf_validator.py` | 53 | PASS |
 | `tests/test_stats_analytics.py` | 26 | PASS |
 | `tests/test_telemetry.py` | 35 | PASS |
+| `tests/test_tls_config.py` | 14 | PASS |
 | `tests/test_url_repository.py` | 21 | PASS |
-| **Total** | **190** | **PASS** |
+| **Total** | **204** | **PASS** |
 
 ---
 
@@ -136,7 +137,7 @@ No injection vulnerabilities, hardcoded secrets, weak cryptography, insecure des
 
 ### Coverage improvement
 
-The addition of `tests/test_stats_analytics.py` (26 tests) brought `app/app.py` from **0% → 66%** by exercising the two new endpoints via `httpx.AsyncClient` with a null lifespan fixture. The subsequent addition of `tests/test_app.py` (18 integration tests for `POST /shorten` and `GET /{short_code}`) pushed overall coverage from **87% → 92%** and `app/app.py` from **66% → 80%**.
+The addition of `tests/test_stats_analytics.py` (26 tests) brought `app/app.py` from **0% → 66%** by exercising the two new endpoints via `httpx.AsyncClient` with a null lifespan fixture. The subsequent addition of `tests/test_app.py` (18 integration tests for `POST /shorten` and `GET /{short_code}`) pushed overall coverage from **87% → 92%** and `app/app.py` from **66% → 80%**. `tests/test_tls_config.py` (14 tests) enforces TLS configuration contracts for the Nginx layer without touching application coverage.
 
 ### Coverage gap detail
 
